@@ -1,0 +1,1409 @@
+[
+  {
+    "id": "f1a0c0de00000001",
+    "type": "subflow",
+    "name": "ROS2 呼叫服務",
+    "info": "呼叫一個 ROS 2 服務（透過 rosbridge）。\n\n### 設定\n- **SERVICE**：服務名稱，例如 `/MAV1/api/takeoff`\n- **TIMEOUT**：最多等幾秒，預設 10\n- **ROSBRIDGE_URL**：預設 `ws://127.0.0.1:9090`\n\n### 輸入\n`msg.payload` = 服務要帶的參數（物件），例如 `{\"altitude\": 1.5}`。\n不需要參數的服務（`std_srvs/Trigger`）可以不填。\n\n### 輸出\n- `msg.payload` = 服務的回覆，例如 `{\"success\": true, \"message\": \"...\"}`\n- `msg.ros` = `{ service, id, result, timedOut }`\n\n逾時、沒連上、服務不存在時，一樣會輸出 `{\"success\": false, \"message\": 原因}`，\n不會卡住。\n\n### 狀態\n積木下方顯示「已連線」或「未連線」。斷線會每 3 秒自動重連。\n\n\ngenerated-by: drone_nodered",
+    "category": "ROS 2",
+    "in": [
+      {
+        "x": 60,
+        "y": 80,
+        "wires": [
+          {
+            "id": "f1a0c0de00000102"
+          }
+        ]
+      }
+    ],
+    "out": [
+      {
+        "x": 760,
+        "y": 80,
+        "wires": [
+          {
+            "id": "f1a0c0de00000102",
+            "port": 1
+          },
+          {
+            "id": "f1a0c0de00000105",
+            "port": 0
+          }
+        ]
+      }
+    ],
+    "env": [
+      {
+        "name": "SERVICE",
+        "type": "str",
+        "value": ""
+      },
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "10"
+      },
+      {
+        "name": "ROSBRIDGE_URL",
+        "type": "str",
+        "value": "ws://127.0.0.1:9090"
+      }
+    ],
+    "meta": {
+      "module": "nodered_ros2",
+      "version": "0.1.0"
+    },
+    "color": "#A6BBCF",
+    "icon": "font-awesome/fa-exchange",
+    "inputLabels": [
+      "服務參數"
+    ],
+    "outputLabels": [
+      "服務回覆"
+    ],
+    "status": {
+      "x": 760,
+      "y": 220,
+      "wires": [
+        {
+          "id": "f1a0c0de00000107",
+          "port": 0
+        }
+      ]
+    }
+  },
+  {
+    "id": "f1a0c0de00000101",
+    "type": "websocket-client",
+    "z": "f1a0c0de00000001",
+    "path": "${ROSBRIDGE_URL}",
+    "tls": "",
+    "wholemsg": "false",
+    "hb": "0",
+    "subprotocol": "",
+    "headers": []
+  },
+  {
+    "id": "f1a0c0de00000102",
+    "type": "function",
+    "z": "f1a0c0de00000001",
+    "name": "組出 call_service",
+    "func": "// ============================================================\n//  送出服務呼叫\n//  輸入：msg.payload = 服務要帶的參數（物件），例如 {altitude: 1.5}\n//        沒有參數的服務（std_srvs/Trigger）可以不填\n//  輸出 1 → websocket out（送給 rosbridge）\n//  輸出 2 → 積木的輸出（立刻失敗、或逾時的時候）\n// ============================================================\nconst service = env.get(\"SERVICE\");\nconst url = env.get(\"ROSBRIDGE_URL\");\n\nfunction failNow(message) {\n    msg.payload = { success: false, message };\n    msg.ros = { service, timedOut: false };\n    return [null, msg];\n}\n\nif (!service) return failNow(\"積木沒有設定服務名稱（SERVICE）\");\n// 沒連上時 websocket out 送出會直接被丟掉（只印一行警告），\n// 使用者會以為指令送出了。所以先擋下來，立刻告訴他原因。\nif (!flow.get(\"connected\")) return failNow(`還沒連上 rosbridge（${url}）`);\n\n// 每次呼叫一個不重複的 id，回覆時用它對回「是哪一次呼叫」。\n// 雖然每個積木有自己的連線、不會收到別人的回覆，但同一個積木\n// 可能連按兩次，還是要分得出來。\nconst id = `call_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;\nconst args = (msg.payload && typeof msg.payload === \"object\" && !Array.isArray(msg.payload))\n    ? msg.payload : {};\n\n// 把原本的 msg 存起來，回覆時沿用（使用者在 msg 上加的欄位不會不見）。\n// flow context 在 subflow 裡是「這個積木自己的」，不會跟別的積木混在一起。\nconst pending = flow.get(\"pending\") || {};\npending[id] = RED.util.cloneMessage(msg);\nflow.set(\"pending\", pending);\n\nconst timeoutS = Number(env.get(\"TIMEOUT\")) > 0 ? Number(env.get(\"TIMEOUT\")) : 10;\nsetTimeout(() => {\n    const p = flow.get(\"pending\") || {};\n    if (!p[id]) return;                 // 已經收到回覆了\n    const orig = p[id];\n    delete p[id];\n    flow.set(\"pending\", p);\n    orig.payload = { success: false, message: `${timeoutS} 秒內沒有回應` };\n    orig.ros = { service, id, timedOut: true };\n    node.send([null, orig]);\n}, timeoutS * 1000);\n\n// rosbridge 協定的 call_service：op / id / service / args\nreturn [{ payload: JSON.stringify({ op: \"call_service\", id, service, args }) }, null];\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 230,
+    "y": 80,
+    "wires": [
+      [
+        "f1a0c0de00000103"
+      ],
+      []
+    ]
+  },
+  {
+    "id": "f1a0c0de00000103",
+    "type": "websocket out",
+    "z": "f1a0c0de00000001",
+    "name": "",
+    "server": "",
+    "client": "f1a0c0de00000101",
+    "x": 480,
+    "y": 80,
+    "wires": []
+  },
+  {
+    "id": "f1a0c0de00000104",
+    "type": "websocket in",
+    "z": "f1a0c0de00000001",
+    "name": "",
+    "server": "",
+    "client": "f1a0c0de00000101",
+    "x": 160,
+    "y": 160,
+    "wires": [
+      [
+        "f1a0c0de00000105"
+      ]
+    ]
+  },
+  {
+    "id": "f1a0c0de00000105",
+    "type": "function",
+    "z": "f1a0c0de00000001",
+    "name": "挑出服務回覆",
+    "func": "// ============================================================\n//  收到 rosbridge 的訊息，挑出服務回覆\n// ============================================================\nlet m;\ntry {\n    // 收到的可能是 Buffer（ws 函式庫的行為），先轉成字串\n    m = JSON.parse(Buffer.isBuffer(msg.payload) ? msg.payload.toString() : msg.payload);\n} catch (e) {\n    return null;\n}\nif (m.op !== \"service_response\") return null;\n\nconst p = flow.get(\"pending\") || {};\nconst orig = p[m.id];\nif (!orig) return null;                 // 不是這個積木送的，或已經逾時\ndelete p[m.id];\nflow.set(\"pending\", p);\n\nif (m.result) {\n    // 服務正常回覆：values 就是服務的回傳內容，例如 { success, message }\n    orig.payload = m.values;\n} else {\n    // rosbridge 本身呼叫失敗（服務不存在、格式不對…），values 是錯誤訊息\n    const detail = typeof m.values === \"string\" ? m.values : JSON.stringify(m.values);\n    orig.payload = { success: false, message: `rosbridge 呼叫失敗：${detail}` };\n}\norig.ros = { service: env.get(\"SERVICE\"), id: m.id, result: m.result, timedOut: false };\nreturn orig;\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 480,
+    "y": 160,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "f1a0c0de00000106",
+    "type": "status",
+    "z": "f1a0c0de00000001",
+    "name": "連線狀態",
+    "scope": [
+      "f1a0c0de00000104"
+    ],
+    "x": 140,
+    "y": 220,
+    "wires": [
+      [
+        "f1a0c0de00000107"
+      ]
+    ]
+  },
+  {
+    "id": "f1a0c0de00000107",
+    "type": "function",
+    "z": "f1a0c0de00000001",
+    "name": "記錄連線",
+    "func": "// ============================================================\n//  追蹤連線狀態（websocket in 連上／斷線時會發出狀態事件）\n//  顯示在積木下方，並記下目前有沒有連上\n// ============================================================\nconst ev = msg.status && msg.status.event;\nif (ev === \"connect\") {\n    flow.set(\"connected\", true);\n    return { payload: { fill: \"green\", shape: \"dot\", text: \"已連線\" } };\n}\nif (ev === \"disconnect\" || ev === \"error\") {\n    flow.set(\"connected\", false);\n    // 斷線後 Node-RED 每 3 秒會自動重連（22-websocket.js），這裡不用處理\n    return { payload: { fill: \"red\", shape: \"ring\", text: \"未連線（自動重連中）\" } };\n}\nreturn null;\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 480,
+    "y": 220,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "f1a0c0de00000002",
+    "type": "subflow",
+    "name": "ROS2 訂閱",
+    "info": "訂閱一個 ROS 2 topic（透過 rosbridge），每收到一筆就輸出一次。\n\n### 設定\n- **TOPIC**：topic 名稱，例如 `/MAV1/api/status`\n- **TYPE**：訊息型別，例如 `std_msgs/msg/String`（可留空讓 rosbridge 自己判斷）\n- **THROTTLE_MS**：最快每幾毫秒送一筆，0 = 不限制\n- **ROSBRIDGE_URL**：預設 `ws://127.0.0.1:9090`\n\n### 輸出\n- `msg.payload` = ROS 訊息本身，例如 `std_msgs/String` 是 `{\"data\": \"...\"}`\n- `msg.topic` = topic 名稱\n\n### 狀態\n積木下方顯示「已訂閱」或「未連線」。\nrosbridge 重開後會自動重新連線、重新訂閱。\n\n\ngenerated-by: drone_nodered",
+    "category": "ROS 2",
+    "in": [],
+    "out": [
+      {
+        "x": 700,
+        "y": 80,
+        "wires": [
+          {
+            "id": "f1a0c0de00000204",
+            "port": 0
+          }
+        ]
+      }
+    ],
+    "env": [
+      {
+        "name": "TOPIC",
+        "type": "str",
+        "value": ""
+      },
+      {
+        "name": "TYPE",
+        "type": "str",
+        "value": ""
+      },
+      {
+        "name": "THROTTLE_MS",
+        "type": "num",
+        "value": "0"
+      },
+      {
+        "name": "ROSBRIDGE_URL",
+        "type": "str",
+        "value": "ws://127.0.0.1:9090"
+      }
+    ],
+    "meta": {
+      "module": "nodered_ros2",
+      "version": "0.1.0"
+    },
+    "color": "#A6BBCF",
+    "icon": "font-awesome/fa-rss",
+    "outputLabels": [
+      "ROS 訊息"
+    ],
+    "status": {
+      "x": 700,
+      "y": 160,
+      "wires": [
+        {
+          "id": "f1a0c0de00000206",
+          "port": 1
+        }
+      ]
+    }
+  },
+  {
+    "id": "f1a0c0de00000201",
+    "type": "websocket-client",
+    "z": "f1a0c0de00000002",
+    "path": "${ROSBRIDGE_URL}",
+    "tls": "",
+    "wholemsg": "false",
+    "hb": "0",
+    "subprotocol": "",
+    "headers": []
+  },
+  {
+    "id": "f1a0c0de00000203",
+    "type": "websocket in",
+    "z": "f1a0c0de00000002",
+    "name": "",
+    "server": "",
+    "client": "f1a0c0de00000201",
+    "x": 160,
+    "y": 80,
+    "wires": [
+      [
+        "f1a0c0de00000204"
+      ]
+    ]
+  },
+  {
+    "id": "f1a0c0de00000204",
+    "type": "function",
+    "z": "f1a0c0de00000002",
+    "name": "只留這個 topic",
+    "func": "// ============================================================\n//  收到 rosbridge 的訊息，只留這個 topic 的資料\n// ============================================================\nlet m;\ntry {\n    m = JSON.parse(Buffer.isBuffer(msg.payload) ? msg.payload.toString() : msg.payload);\n} catch (e) {\n    return null;\n}\nif (m.op !== \"publish\" || m.topic !== env.get(\"TOPIC\")) return null;\n// payload 就是 ROS 訊息本身，例如 std_msgs/String 會是 { data: \"...\" }\nreturn { topic: m.topic, payload: m.msg };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 420,
+    "y": 80,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "f1a0c0de00000205",
+    "type": "status",
+    "z": "f1a0c0de00000002",
+    "name": "連線狀態",
+    "scope": [
+      "f1a0c0de00000203"
+    ],
+    "x": 140,
+    "y": 160,
+    "wires": [
+      [
+        "f1a0c0de00000206"
+      ]
+    ]
+  },
+  {
+    "id": "f1a0c0de00000206",
+    "type": "function",
+    "z": "f1a0c0de00000002",
+    "name": "連上就訂閱",
+    "func": "// ============================================================\n//  連上時送出訂閱；斷線時更新狀態\n//  輸出 1 → websocket out（subscribe 請求）\n//  輸出 2 → 積木下方的狀態\n// ============================================================\nconst ev = msg.status && msg.status.event;\nconst topic = env.get(\"TOPIC\");\n\nif (ev === \"connect\") {\n    if (!topic) {\n        return [null, { payload: { fill: \"red\", shape: \"ring\", text: \"沒有設定 TOPIC\" } }];\n    }\n    // ⚠️ 每次（重新）連上都要再訂閱一次。\n    //    rosbridge 不會記得之前誰訂閱過什麼，重開之後訂閱就消失了。\n    const req = { op: \"subscribe\", id: `sub_${topic}`, topic };\n    const type = env.get(\"TYPE\");\n    if (type) req.type = type;\n    const throttle = Number(env.get(\"THROTTLE_MS\"));\n    if (throttle > 0) req.throttle_rate = throttle;   // rosbridge 端限制最快多久送一筆\n    return [\n        { payload: JSON.stringify(req) },\n        { payload: { fill: \"green\", shape: \"dot\", text: `已訂閱 ${topic}` } },\n    ];\n}\nif (ev === \"disconnect\" || ev === \"error\") {\n    return [null, { payload: { fill: \"red\", shape: \"ring\", text: \"未連線（自動重連中）\" } }];\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 380,
+    "y": 160,
+    "wires": [
+      [
+        "f1a0c0de00000202"
+      ],
+      []
+    ]
+  },
+  {
+    "id": "f1a0c0de00000202",
+    "type": "websocket out",
+    "z": "f1a0c0de00000002",
+    "name": "",
+    "server": "",
+    "client": "f1a0c0de00000201",
+    "x": 600,
+    "y": 220,
+    "wires": []
+  },
+  {
+    "id": "d0c0ffeeb0b10000",
+    "type": "subflow",
+    "name": "車：導航到座標",
+    "info": "generated-by: husky_nodered\n\n送出「車：導航到座標」給地面車，並等它真的做完。\n\n上面出口＝完成、下面出口＝失敗（逾時或被拒絕）。\n對應服務 /husky/api/goto。",
+    "category": "地面車",
+    "color": "#E6C8A0",
+    "in": [
+      {
+        "x": 40,
+        "y": 80,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b10001"
+          }
+        ]
+      }
+    ],
+    "out": [
+      {
+        "x": 560,
+        "y": 40,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b10003",
+            "port": 0
+          }
+        ]
+      },
+      {
+        "x": 560,
+        "y": 120,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b10003",
+            "port": 1
+          }
+        ]
+      }
+    ],
+    "outputLabels": [
+      "完成",
+      "失敗"
+    ],
+    "env": [
+      {
+        "name": "MAP_X",
+        "type": "num",
+        "value": "0.0",
+        "ui": {
+          "label": {
+            "zh-TW": "目標 x（map 座標，東為正）"
+          },
+          "type": "input",
+          "opts": {
+            "types": [
+              "num"
+            ]
+          }
+        }
+      },
+      {
+        "name": "MAP_Y",
+        "type": "num",
+        "value": "0.0",
+        "ui": {
+          "label": {
+            "zh-TW": "目標 y（map 座標，北為正）"
+          },
+          "type": "input",
+          "opts": {
+            "types": [
+              "num"
+            ]
+          }
+        }
+      },
+      {
+        "name": "YAW",
+        "type": "num",
+        "value": "999",
+        "ui": {
+          "label": {
+            "zh-TW": "終點車頭朝向（弧度；999 = 不指定）"
+          },
+          "type": "input",
+          "opts": {
+            "types": [
+              "num"
+            ]
+          }
+        }
+      },
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "180",
+        "ui": {
+          "label": {
+            "zh-TW": "逾時（秒）"
+          },
+          "type": "input",
+          "opts": {
+            "types": [
+              "num"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b10001",
+    "type": "function",
+    "z": "d0c0ffeeb0b10000",
+    "name": "組參數",
+    "func": "const incoming = (msg.payload && typeof msg.payload === 'object')\n    ? msg.payload : {};\nmsg.payload = { map_x: Number(env.get(\"MAP_X\")),\n                map_y: Number(env.get(\"MAP_Y\")),\n                yaw: Number(env.get(\"YAW\")), timeout: 0 };\n// 傳進來的值可以覆蓋，但只限這個動作本來就有的欄位\nfor (const k of Object.keys(msg.payload)) {\n    if (k in incoming) { msg.payload[k] = incoming[k]; }\n}\n// 記下送指令前的任務編號，等待時才分得出新舊任務\nmsg._seq_before = ((global.get(\"husky_status\") || {}).task || {}).seq;\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 160,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b10002"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b10002",
+    "type": "subflow:f1a0c0de00000001",
+    "z": "d0c0ffeeb0b10000",
+    "name": "/husky/api/goto",
+    "env": [
+      {
+        "name": "SERVICE",
+        "type": "str",
+        "value": "/husky/api/goto"
+      },
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "10"
+      }
+    ],
+    "x": 320,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b10003"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b10003",
+    "type": "function",
+    "z": "d0c0ffeeb0b10000",
+    "name": "等任務完成",
+    "func": "// 等 drone_api_node 回報「上一個動作做完了」\n//\n// 為什麼不是等服務回應就好：服務是「下單」不是「送達」。按下起飛，服務 0.05 秒就回\n// 「已開始起飛」，但飛機要 20 秒才爬到。真正的完成寫在狀態的 task 欄位裡。\n//\n// 為什麼要看時間戳：狀態每 0.5 秒才發一次，剛進來時讀到的可能還是「上一個動作」的\n// 結果（已完成），那會讓這個積木立刻放行。所以只認「開始等之後才發布」的那一筆。\n// 服務當場就被拒絕（參數錯、飛機在地上…），不用等，直接走失敗\nif (msg.payload && msg.payload.success === false) {\n    node.status({ fill: \"red\", shape: \"ring\", text: \"被拒絕\" });\n    return { payload: { 失敗: msg.payload.message || \"服務呼叫被拒絕\" } };\n}\n\nconst t0 = Date.now();\nconst limit = Number(env.get(\"TIMEOUT\") || 120) * 1000;\n// 送指令前的任務編號。要等到「編號和它不一樣」才算是這次的任務 ——\n// 否則指令沒送成功時，會讀到上一個已完成的任務就放行（2026-09-24 踩到）。\nconst before = msg._seq_before;\nlet seq = null;\n\nconst timer = setInterval(() => {\n    const s = global.get(\"husky_status\");\n    if (!s || !s._t || s._t < t0) {                 // 還沒有新鮮的狀態\n        if (Date.now() - t0 > limit) { stop(); fail(\"等不到狀態更新\"); }\n        return;\n    }\n    const task = s.task || {};\n    if (seq === null) {\n        if (task.seq === before) { return; }        // 還是上一個任務，繼續等\n        seq = task.seq;                             // 鎖定這一次的任務\n    }\n    if (task.seq !== seq) {\n        // 有人按了別的按鈕 —— 這不是「失敗」，是使用者接手了。\n        // 什麼都不輸出，流程安靜停在這裡，不要自作主張去降落。\n        stop();\n        node.status({ fill: \"grey\", shape: \"ring\", text: \"已被手動指令接手\" });\n        node.warn(\"任務已被手動指令接手，流程停止\");\n        return;\n    }\n\n    if (task.state === \"done\") {\n        stop();\n        msg.payload = { 完成: task.name, 說明: task.message };\n        node.send([msg, null]);\n    } else if (task.state === \"failed\") {\n        stop();\n        fail(`${task.name}：${task.message}`);\n    } else if (Date.now() - t0 > limit) {\n        stop();\n        fail(`等待逾時（${limit / 1000} 秒）`);\n    } else {\n        node.status({ fill: \"blue\", shape: \"dot\", text: `等 ${task.name}…` });\n    }\n}, 200);\n\nfunction stop() { clearInterval(timer); }\nfunction fail(why) {\n    node.status({ fill: \"red\", shape: \"ring\", text: why });\n    msg.payload = { 失敗: why };\n    node.send([null, msg]);      // 第二個出口＝失敗，接你想要的處置\n}\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 460,
+    "y": 80,
+    "wires": [
+      [],
+      []
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b20000",
+    "type": "subflow",
+    "name": "車：停止",
+    "info": "generated-by: husky_nodered\n\n送出「車：停止」給地面車，並等它真的做完。\n\n上面出口＝完成、下面出口＝失敗（逾時或被拒絕）。\n對應服務 /husky/api/stop。",
+    "category": "地面車",
+    "color": "#E6C8A0",
+    "in": [
+      {
+        "x": 40,
+        "y": 80,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b20001"
+          }
+        ]
+      }
+    ],
+    "out": [
+      {
+        "x": 560,
+        "y": 40,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b20003",
+            "port": 0
+          }
+        ]
+      },
+      {
+        "x": 560,
+        "y": 120,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b20003",
+            "port": 1
+          }
+        ]
+      }
+    ],
+    "outputLabels": [
+      "完成",
+      "失敗"
+    ],
+    "env": [
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "10",
+        "ui": {
+          "label": {
+            "zh-TW": "逾時（秒）"
+          },
+          "type": "input",
+          "opts": {
+            "types": [
+              "num"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b20001",
+    "type": "function",
+    "z": "d0c0ffeeb0b20000",
+    "name": "組參數",
+    "func": "const incoming = (msg.payload && typeof msg.payload === 'object')\n    ? msg.payload : {};\nmsg.payload = {};\n// 傳進來的值可以覆蓋，但只限這個動作本來就有的欄位\nfor (const k of Object.keys(msg.payload)) {\n    if (k in incoming) { msg.payload[k] = incoming[k]; }\n}\n// 記下送指令前的任務編號，等待時才分得出新舊任務\nmsg._seq_before = ((global.get(\"husky_status\") || {}).task || {}).seq;\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 160,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b20002"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b20002",
+    "type": "subflow:f1a0c0de00000001",
+    "z": "d0c0ffeeb0b20000",
+    "name": "/husky/api/stop",
+    "env": [
+      {
+        "name": "SERVICE",
+        "type": "str",
+        "value": "/husky/api/stop"
+      },
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "10"
+      }
+    ],
+    "x": 320,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b20003"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b20003",
+    "type": "function",
+    "z": "d0c0ffeeb0b20000",
+    "name": "等任務完成",
+    "func": "// 等 drone_api_node 回報「上一個動作做完了」\n//\n// 為什麼不是等服務回應就好：服務是「下單」不是「送達」。按下起飛，服務 0.05 秒就回\n// 「已開始起飛」，但飛機要 20 秒才爬到。真正的完成寫在狀態的 task 欄位裡。\n//\n// 為什麼要看時間戳：狀態每 0.5 秒才發一次，剛進來時讀到的可能還是「上一個動作」的\n// 結果（已完成），那會讓這個積木立刻放行。所以只認「開始等之後才發布」的那一筆。\n// 服務當場就被拒絕（參數錯、飛機在地上…），不用等，直接走失敗\nif (msg.payload && msg.payload.success === false) {\n    node.status({ fill: \"red\", shape: \"ring\", text: \"被拒絕\" });\n    return { payload: { 失敗: msg.payload.message || \"服務呼叫被拒絕\" } };\n}\n\nconst t0 = Date.now();\nconst limit = Number(env.get(\"TIMEOUT\") || 120) * 1000;\n// 送指令前的任務編號。要等到「編號和它不一樣」才算是這次的任務 ——\n// 否則指令沒送成功時，會讀到上一個已完成的任務就放行（2026-09-24 踩到）。\nconst before = msg._seq_before;\nlet seq = null;\n\nconst timer = setInterval(() => {\n    const s = global.get(\"husky_status\");\n    if (!s || !s._t || s._t < t0) {                 // 還沒有新鮮的狀態\n        if (Date.now() - t0 > limit) { stop(); fail(\"等不到狀態更新\"); }\n        return;\n    }\n    const task = s.task || {};\n    if (seq === null) {\n        if (task.seq === before) { return; }        // 還是上一個任務，繼續等\n        seq = task.seq;                             // 鎖定這一次的任務\n    }\n    if (task.seq !== seq) {\n        // 有人按了別的按鈕 —— 這不是「失敗」，是使用者接手了。\n        // 什麼都不輸出，流程安靜停在這裡，不要自作主張去降落。\n        stop();\n        node.status({ fill: \"grey\", shape: \"ring\", text: \"已被手動指令接手\" });\n        node.warn(\"任務已被手動指令接手，流程停止\");\n        return;\n    }\n\n    if (task.state === \"done\") {\n        stop();\n        msg.payload = { 完成: task.name, 說明: task.message };\n        node.send([msg, null]);\n    } else if (task.state === \"failed\") {\n        stop();\n        fail(`${task.name}：${task.message}`);\n    } else if (Date.now() - t0 > limit) {\n        stop();\n        fail(`等待逾時（${limit / 1000} 秒）`);\n    } else {\n        node.status({ fill: \"blue\", shape: \"dot\", text: `等 ${task.name}…` });\n    }\n}, 200);\n\nfunction stop() { clearInterval(timer); }\nfunction fail(why) {\n    node.status({ fill: \"red\", shape: \"ring\", text: why });\n    msg.payload = { 失敗: why };\n    node.send([null, msg]);      // 第二個出口＝失敗，接你想要的處置\n}\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 460,
+    "y": 80,
+    "wires": [
+      [],
+      []
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b30000",
+    "type": "subflow",
+    "name": "車：狀態查詢",
+    "info": "generated-by: husky_nodered\n\n送出「車：狀態查詢」給地面車，並等它真的做完。\n\n上面出口＝完成、下面出口＝失敗（逾時或被拒絕）。\n對應服務 /husky/api/state。",
+    "category": "地面車",
+    "color": "#E6C8A0",
+    "in": [
+      {
+        "x": 40,
+        "y": 80,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b30001"
+          }
+        ]
+      }
+    ],
+    "out": [
+      {
+        "x": 560,
+        "y": 40,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b30003",
+            "port": 0
+          }
+        ]
+      },
+      {
+        "x": 560,
+        "y": 120,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b30003",
+            "port": 1
+          }
+        ]
+      }
+    ],
+    "outputLabels": [
+      "完成",
+      "失敗"
+    ],
+    "env": [
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "10",
+        "ui": {
+          "label": {
+            "zh-TW": "逾時（秒）"
+          },
+          "type": "input",
+          "opts": {
+            "types": [
+              "num"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b30001",
+    "type": "function",
+    "z": "d0c0ffeeb0b30000",
+    "name": "組參數",
+    "func": "const incoming = (msg.payload && typeof msg.payload === 'object')\n    ? msg.payload : {};\nmsg.payload = {};\n// 傳進來的值可以覆蓋，但只限這個動作本來就有的欄位\nfor (const k of Object.keys(msg.payload)) {\n    if (k in incoming) { msg.payload[k] = incoming[k]; }\n}\n// 記下送指令前的任務編號，等待時才分得出新舊任務\nmsg._seq_before = ((global.get(\"husky_status\") || {}).task || {}).seq;\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 160,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b30002"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b30002",
+    "type": "subflow:f1a0c0de00000001",
+    "z": "d0c0ffeeb0b30000",
+    "name": "/husky/api/state",
+    "env": [
+      {
+        "name": "SERVICE",
+        "type": "str",
+        "value": "/husky/api/state"
+      },
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "10"
+      }
+    ],
+    "x": 320,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b30003"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b30003",
+    "type": "function",
+    "z": "d0c0ffeeb0b30000",
+    "name": "等任務完成",
+    "func": "// 等 drone_api_node 回報「上一個動作做完了」\n//\n// 為什麼不是等服務回應就好：服務是「下單」不是「送達」。按下起飛，服務 0.05 秒就回\n// 「已開始起飛」，但飛機要 20 秒才爬到。真正的完成寫在狀態的 task 欄位裡。\n//\n// 為什麼要看時間戳：狀態每 0.5 秒才發一次，剛進來時讀到的可能還是「上一個動作」的\n// 結果（已完成），那會讓這個積木立刻放行。所以只認「開始等之後才發布」的那一筆。\n// 服務當場就被拒絕（參數錯、飛機在地上…），不用等，直接走失敗\nif (msg.payload && msg.payload.success === false) {\n    node.status({ fill: \"red\", shape: \"ring\", text: \"被拒絕\" });\n    return { payload: { 失敗: msg.payload.message || \"服務呼叫被拒絕\" } };\n}\n\nconst t0 = Date.now();\nconst limit = Number(env.get(\"TIMEOUT\") || 120) * 1000;\n// 送指令前的任務編號。要等到「編號和它不一樣」才算是這次的任務 ——\n// 否則指令沒送成功時，會讀到上一個已完成的任務就放行（2026-09-24 踩到）。\nconst before = msg._seq_before;\nlet seq = null;\n\nconst timer = setInterval(() => {\n    const s = global.get(\"husky_status\");\n    if (!s || !s._t || s._t < t0) {                 // 還沒有新鮮的狀態\n        if (Date.now() - t0 > limit) { stop(); fail(\"等不到狀態更新\"); }\n        return;\n    }\n    const task = s.task || {};\n    if (seq === null) {\n        if (task.seq === before) { return; }        // 還是上一個任務，繼續等\n        seq = task.seq;                             // 鎖定這一次的任務\n    }\n    if (task.seq !== seq) {\n        // 有人按了別的按鈕 —— 這不是「失敗」，是使用者接手了。\n        // 什麼都不輸出，流程安靜停在這裡，不要自作主張去降落。\n        stop();\n        node.status({ fill: \"grey\", shape: \"ring\", text: \"已被手動指令接手\" });\n        node.warn(\"任務已被手動指令接手，流程停止\");\n        return;\n    }\n\n    if (task.state === \"done\") {\n        stop();\n        msg.payload = { 完成: task.name, 說明: task.message };\n        node.send([msg, null]);\n    } else if (task.state === \"failed\") {\n        stop();\n        fail(`${task.name}：${task.message}`);\n    } else if (Date.now() - t0 > limit) {\n        stop();\n        fail(`等待逾時（${limit / 1000} 秒）`);\n    } else {\n        node.status({ fill: \"blue\", shape: \"dot\", text: `等 ${task.name}…` });\n    }\n}, 200);\n\nfunction stop() { clearInterval(timer); }\nfunction fail(why) {\n    node.status({ fill: \"red\", shape: \"ring\", text: why });\n    msg.payload = { 失敗: why };\n    node.send([null, msg]);      // 第二個出口＝失敗，接你想要的處置\n}\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 460,
+    "y": 80,
+    "wires": [
+      [],
+      []
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b90000",
+    "type": "subflow",
+    "name": "車：返航",
+    "info": "generated-by: husky_nodered\n\n把車開回出發點。\n\n**沒有對應的服務** —— 它就是「讀 scene.home ＋ 導航到座標」。\n家的座標來自 api/status 的 scene.home（husky_api_node 從\nwarehouse_geometry.yaml 的 husky_spawn 讀的）。",
+    "category": "地面車",
+    "color": "#E6C8A0",
+    "in": [
+      {
+        "x": 40,
+        "y": 80,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b90001"
+          }
+        ]
+      }
+    ],
+    "out": [
+      {
+        "x": 620,
+        "y": 40,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b90002",
+            "port": 0
+          }
+        ]
+      },
+      {
+        "x": 620,
+        "y": 140,
+        "wires": [
+          {
+            "id": "d0c0ffeeb0b90001",
+            "port": 1
+          },
+          {
+            "id": "d0c0ffeeb0b90002",
+            "port": 1
+          }
+        ]
+      }
+    ],
+    "outputLabels": [
+      "完成",
+      "失敗"
+    ],
+    "env": []
+  },
+  {
+    "id": "d0c0ffeeb0b90001",
+    "type": "function",
+    "z": "d0c0ffeeb0b90000",
+    "name": "取回家座標",
+    "func": "// 回家＝車子的 spawn 位置，由 husky_api_node 從 warehouse_geometry.yaml\n// 的 husky_spawn 讀出來放進狀態的 scene.home。\n// ⚠️ 不要退回 (0,0) —— map 的原點是倉庫正中央，不是車子的家。\n//    拿不到就走失敗出口，寧可不動也不要開到別的地方。\nconst s = global.get(\"husky_status\") || {};\nconst home = (s.scene || {}).home;\nif (!Array.isArray(home) || typeof home[0] !== \"number\"\n        || typeof home[1] !== \"number\") {\n    node.status({ fill: \"red\", shape: \"ring\", text: \"不知道家在哪\" });\n    return [null, { payload: { 失敗: \"不知道家在哪：api/status 裡沒有 scene.home\" } }];\n}\n// 只送「導航到座標」本來就有的欄位 —— 整包 assign 會塞進服務不認得的欄位\nreturn [{ payload: { map_x: home[0], map_y: home[1], yaw: 999 } }, null];",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 180,
+    "y": 80,
+    "wires": [
+      [
+        "d0c0ffeeb0b90002"
+      ],
+      []
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0b90002",
+    "type": "subflow:d0c0ffeeb0b10000",
+    "z": "d0c0ffeeb0b90000",
+    "name": "導航回家",
+    "env": [
+      {
+        "name": "TIMEOUT",
+        "type": "num",
+        "value": "240"
+      }
+    ],
+    "x": 420,
+    "y": 80,
+    "wires": [
+      [],
+      []
+    ]
+  },
+  {
+    "id": "d0c0ffeeb0grp001",
+    "type": "ui-group",
+    "name": "地面車（Husky）",
+    "page": "d0c0ffeeui000003",
+    "width": 4,
+    "height": 1,
+    "order": 3,
+    "showTitle": true,
+    "className": "",
+    "visible": true,
+    "disabled": false,
+    "groupType": "default"
+  },
+  {
+    "id": "d0c0ffeeb0grp002",
+    "type": "ui-group",
+    "name": "地面車指令",
+    "page": "d0c0ffeeui000003",
+    "width": 6,
+    "height": 1,
+    "order": 6,
+    "showTitle": true,
+    "className": "",
+    "visible": true,
+    "disabled": false,
+    "groupType": "default"
+  },
+  {
+    "id": "d0c0ffeeb0ffff01",
+    "type": "tab",
+    "label": "地面車（Husky）",
+    "disabled": false,
+    "info": "generated-by: husky_nodered\n\nHusky A200 的控制。由 husky_nodered/nodered/make_husky_basic.py 產生。\n\n四個積木：導航到座標／停止／狀態查詢／返航（組合）。\n服務在 /husky/api/* ，狀態在 /husky/api/status。\n\n⚠️ 這個分頁是產生出來的，手改會在下次更新流程時被覆蓋。\n要組自己的任務請另開分頁，merge_flows.py 不會動使用者自建的分頁。"
+  },
+  {
+    "id": "d0c0ffeeb1000003",
+    "type": "comment",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "這個分頁是產生出來的 —— 要改請改 make_husky_basic.py",
+    "info": "",
+    "x": 300,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "d0c0ffeeb1000001",
+    "type": "subflow:f1a0c0de00000002",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "/husky/api/status",
+    "env": [
+      {
+        "name": "TOPIC",
+        "type": "str",
+        "value": "/husky/api/status"
+      },
+      {
+        "name": "TYPE",
+        "type": "str",
+        "value": "std_msgs/msg/String"
+      },
+      {
+        "name": "THROTTLE_MS",
+        "type": "num",
+        "value": "0"
+      }
+    ],
+    "x": 160,
+    "y": 120,
+    "wires": [
+      [
+        "d0c0ffeeb1000002"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000002",
+    "type": "function",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "存狀態並拆成畫面欄位",
+    "func": "// 收到 /husky/api/status（JSON 字串）→ 存進全域，再拆成畫面要顯示的東西\n//\n// 全域 husky_status 是給積木用的：每個動作積木的「等任務完成」都讀它的\n// task.seq / task.state。無人機那邊同一個位置叫 drone_status。\nlet s;\ntry { s = JSON.parse(msg.payload.data); } catch (e) { return null; }\nglobal.set(\"husky_status\", s);\n\n// --- 地圖 payload：欄位名和無人機完全一樣，所以可以直接餵同一個 widget ---\n// ⚠️ 不要在這裡塞 tx/ty（視覺目標）或 loop（搜尋環線）：地面車沒有感知鏈，\n//    塞了反而會在地圖上畫出不存在的東西。\n// 兩台載具畫在同一張地圖上（2026-11-07）。那張 widget 在無人機的儀表板\n// 分頁上，而 Node-RED 的線不能跨分頁，所以：\n//   ① 各自把自己那半存進全域（無人機 map_air、地面車 map_ugv）\n//   ② 送出去時合併成完整的一份，再用 link 送到那張圖\n// ⚠️ 不能只送自己那半：widget 的 watch 每次都會重設兩台的位置，\n//    只送一半會把另一台從地圖上抹掉。\nconst ugv = {};\nif (typeof s.map_x === \"number\" && typeof s.map_y === \"number\") {\n    ugv.ux = s.map_x;\n    ugv.uy = s.map_y;\n    ugv.uh = s.map_heading_deg || 0;\n}\nglobal.set(\"map_ugv\", ugv);\nconst 地圖 = Object.assign({ boxes: (s.scene && s.scene.boxes) || [] },\n                          global.get(\"map_air\") || {}, ugv);\n\n// --- 就緒燈 ---------------------------------------------------------------\n// ⚠️ 不能沿用無人機那段：它看的是 ready.px4 / ready.position，而地面車是\n//    ready.platform / ready.odom，沿用的話會永遠顯示「未就緒（等 PX4）」。\n//    地圖可以共用，這一段不行（t_map_widget_husky.js 把這個差異釘住了）。\nconst r = s.ready || {};\nconst 缺 = [];\nif (!r.platform) { 缺.push(\"平台\"); }\nif (!r.odom) { 缺.push(\"位置估計\"); }\nif (!r.nav2) { 缺.push(\"導航\"); }\nif (!r.bridge) { 缺.push(\"速度看門狗\"); }\nconst 就緒 = 缺.length ? (\"⏳ 未就緒（等 \" + 缺.join(\"、\") + \"）\") : \"✅ 就緒\";\n// 系統狀態整合在中欄那一行（無人機的 adapter 負責組合），所以這裡不自己顯示，\n// 只把自己那半寫進全域。⚠️ 兩邊的 key 要對上：無人機讀的是 sys_ugv。\nglobal.set(\"sys_ugv\", 就緒);\n\n// --- 位置與動作 -----------------------------------------------------------\n// 格式和無人機那一欄一致（兩欄左右對照才看得出差異）。\n// ⚠️ 不放「就緒」—— 中間那一欄的系統狀態已經整合了兩台，放兩次會讓人\n//    懷疑哪一個才算數。高度只有無人機有，所以這裡少那一段。\nconst 位置 = (typeof s.map_x === \"number\")\n    ? `map (${s.map_x.toFixed(2)}, ${s.map_y.toFixed(2)})　朝向 ${\n        Math.round(s.map_heading_deg || 0)}°　${(s.speed_mps || 0).toFixed(2)} m/s`\n    : \"位置未知\";\nconst t = s.task || {};\nlet 動作 = \"待命\";\nif (t.state === \"running\") {\n    const n = s.nav || {};\n    動作 = (n.state === \"running\" && typeof n.distance_remaining === \"number\")\n        ? `${t.name}　剩 ${n.distance_remaining.toFixed(1)} m`\n        : (t.name || \"執行中\");\n} else if (t.state === \"done\") {\n    動作 = `✅ ${t.name}：${t.message || \"完成\"}`;\n} else if (t.state === \"failed\") {\n    動作 = `❌ ${t.name}：${t.message || \"失敗\"}`;\n}\n// 服務當場被拒絕時不會開任務（task 還是 idle），所以上面那幾條都走不到。\n// 把 last_message 接進來，否則使用者按了按鈕只會看到「待命」，\n// 完全看不出被拒絕的理由（2026-11-07 的症狀）。\n// ⚠️ 這就是為什麼不需要另一行「最近回覆」—— 一行講完。\nif (t.state === \"idle\" && s.last_message) { 動作 = s.last_message; }\n\nreturn [{ payload: Number(s.speed_mps) || 0 }, { payload: 位置 },\n        { payload: 動作 }, { payload: 地圖 }];\n",
+    "outputs": 4,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 460,
+    "y": 120,
+    "wires": [
+      [
+        "d0c0ffeeb1000100"
+      ],
+      [
+        "d0c0ffeeb1000101"
+      ],
+      [
+        "d0c0ffeeb1000102"
+      ],
+      [
+        "d0c0ffeeb1000200"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000100",
+    "type": "ui-gauge",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "速度",
+    "group": "d0c0ffeeb0grp001",
+    "order": 1,
+    "value": "payload",
+    "valueType": "msg",
+    "width": 0,
+    "height": 6,
+    "gtype": "gauge-half",
+    "gstyle": "needle",
+    "title": "速度",
+    "alwaysShowTitle": true,
+    "floatingTitlePosition": "inside",
+    "units": "m/s",
+    "icon": "",
+    "prefix": "",
+    "suffix": "",
+    "segments": [
+      {
+        "from": 0,
+        "color": "#5cd65c"
+      },
+      {
+        "from": 0.8,
+        "color": "#ff8c00"
+      }
+    ],
+    "min": 0,
+    "max": 1.0,
+    "sizeThickness": 16,
+    "sizeGap": 0,
+    "sizeKeyThickness": 8,
+    "styleRounded": true,
+    "styleGlow": false,
+    "className": "",
+    "x": 760,
+    "y": 60,
+    "wires": []
+  },
+  {
+    "id": "d0c0ffeeb1000101",
+    "type": "ui-text",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp001",
+    "order": 2,
+    "width": 0,
+    "height": 1,
+    "name": "狀態",
+    "label": "狀態",
+    "format": "{{msg.payload}}",
+    "layout": "row-spread",
+    "style": false,
+    "font": "",
+    "fontSize": 16,
+    "color": "#717171",
+    "wrapText": false,
+    "className": "",
+    "x": 760,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "d0c0ffeeb1000102",
+    "type": "ui-text",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp001",
+    "order": 3,
+    "width": 0,
+    "height": 1,
+    "name": "任務",
+    "label": "任務",
+    "format": "{{msg.payload}}",
+    "layout": "row-spread",
+    "style": false,
+    "font": "",
+    "fontSize": 16,
+    "color": "#717171",
+    "wrapText": false,
+    "className": "",
+    "x": 760,
+    "y": 180,
+    "wires": []
+  },
+  {
+    "id": "d0c0ffeeb1000200",
+    "type": "link out",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "地圖資料 → 無人機儀表板",
+    "mode": "link",
+    "links": [
+      "d0c0ffeelink0002"
+    ],
+    "x": 920,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "d0c0ffeeb1000050",
+    "type": "ui-number-input",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp002",
+    "name": "目標 x（東為正）",
+    "label": "目標 x（東為正）",
+    "order": 1,
+    "width": 0,
+    "height": 0,
+    "topic": "map_x",
+    "topicType": "str",
+    "min": -18.0,
+    "max": 18.0,
+    "step": 0.1,
+    "tooltip": "",
+    "delay": 300,
+    "passthru": true,
+    "sendOnDelay": true,
+    "sendOnBlur": true,
+    "sendOnEnter": true,
+    "className": "",
+    "clearable": false,
+    "icon": "",
+    "iconPosition": "left",
+    "iconInnerPosition": "inside",
+    "spinner": true,
+    "x": 180,
+    "y": 260,
+    "wires": [
+      [
+        "d0c0ffeeb1000040"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000051",
+    "type": "ui-number-input",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp002",
+    "name": "目標 y（北為正）",
+    "label": "目標 y（北為正）",
+    "order": 2,
+    "width": 0,
+    "height": 0,
+    "topic": "map_y",
+    "topicType": "str",
+    "min": -18.0,
+    "max": 18.0,
+    "step": 0.1,
+    "tooltip": "",
+    "delay": 300,
+    "passthru": true,
+    "sendOnDelay": true,
+    "sendOnBlur": true,
+    "sendOnEnter": true,
+    "className": "",
+    "clearable": false,
+    "icon": "",
+    "iconPosition": "left",
+    "iconInnerPosition": "inside",
+    "spinner": true,
+    "x": 180,
+    "y": 320,
+    "wires": [
+      [
+        "d0c0ffeeb1000040"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000040",
+    "type": "function",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "記住目標座標",
+    "func": "// 存進共用區，按「導航到目標」時才拿出來用\nconst g = global.get(\"husky_goal\") || { map_x: 0, map_y: 0 };\ng[msg.topic] = Number(msg.payload);\nglobal.set(\"husky_goal\", g);\nreturn null;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 460,
+    "y": 290,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000010",
+    "type": "ui-button",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp002",
+    "name": "導航到目標",
+    "label": "導航到目標",
+    "order": 3,
+    "width": 0,
+    "height": 0,
+    "emulateClick": false,
+    "tooltip": "",
+    "color": "",
+    "bgcolor": "",
+    "className": "",
+    "icon": "",
+    "iconPosition": "left",
+    "payload": "",
+    "payloadType": "str",
+    "topic": "導航到目標",
+    "topicType": "str",
+    "buttonColor": "",
+    "textColor": "",
+    "iconColor": "",
+    "enableClick": true,
+    "enablePointerdown": false,
+    "pointerdownPayload": "",
+    "pointerdownPayloadType": "str",
+    "enablePointerup": false,
+    "pointerupPayload": "",
+    "pointerupPayloadType": "str",
+    "x": 320,
+    "y": 380,
+    "wires": [
+      [
+        "d0c0ffeeb1000015"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000015",
+    "type": "function",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "帶入目標座標",
+    "func": "// 畫面上輸入的座標優先；沒輸入過就用倉庫東南角當示範點\nconst g = global.get(\"husky_goal\") || {};\nmsg.payload = { map_x: Number(g.map_x ?? 5.6),\n                map_y: Number(g.map_y ?? -9.0), yaw: 999 };\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 500,
+    "y": 380,
+    "wires": [
+      [
+        "d0c0ffeeb1000020"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000020",
+    "type": "subflow:d0c0ffeeb0b10000",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "導航到座標",
+    "env": [],
+    "x": 700,
+    "y": 380,
+    "wires": [
+      [
+        "d0c0ffeeb1000030"
+      ],
+      [
+        "d0c0ffeeb1000030"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000011",
+    "type": "ui-button",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp002",
+    "name": "返航",
+    "label": "返航",
+    "order": 4,
+    "width": 0,
+    "height": 0,
+    "emulateClick": false,
+    "tooltip": "",
+    "color": "",
+    "bgcolor": "",
+    "className": "",
+    "icon": "",
+    "iconPosition": "left",
+    "payload": "",
+    "payloadType": "str",
+    "topic": "返航",
+    "topicType": "str",
+    "buttonColor": "",
+    "textColor": "",
+    "iconColor": "",
+    "enableClick": true,
+    "enablePointerdown": false,
+    "pointerdownPayload": "",
+    "pointerdownPayloadType": "str",
+    "enablePointerup": false,
+    "pointerupPayload": "",
+    "pointerupPayloadType": "str",
+    "x": 320,
+    "y": 440,
+    "wires": [
+      [
+        "d0c0ffeeb1000021"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000021",
+    "type": "subflow:d0c0ffeeb0b90000",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "返航",
+    "env": [],
+    "x": 700,
+    "y": 440,
+    "wires": [
+      [
+        "d0c0ffeeb1000030"
+      ],
+      [
+        "d0c0ffeeb1000030"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000012",
+    "type": "ui-button",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp002",
+    "name": "停止",
+    "label": "停止",
+    "order": 5,
+    "width": 0,
+    "height": 0,
+    "emulateClick": false,
+    "tooltip": "",
+    "color": "",
+    "bgcolor": "#d93025",
+    "className": "",
+    "icon": "",
+    "iconPosition": "left",
+    "payload": "",
+    "payloadType": "str",
+    "topic": "停止",
+    "topicType": "str",
+    "buttonColor": "#d93025",
+    "textColor": "",
+    "iconColor": "",
+    "enableClick": true,
+    "enablePointerdown": false,
+    "pointerdownPayload": "",
+    "pointerdownPayloadType": "str",
+    "enablePointerup": false,
+    "pointerupPayload": "",
+    "pointerupPayloadType": "str",
+    "x": 320,
+    "y": 500,
+    "wires": [
+      [
+        "d0c0ffeeb1000022"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000022",
+    "type": "subflow:d0c0ffeeb0b20000",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "停止",
+    "env": [],
+    "x": 700,
+    "y": 500,
+    "wires": [
+      [
+        "d0c0ffeeb1000030"
+      ],
+      [
+        "d0c0ffeeb1000030"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000013",
+    "type": "ui-button",
+    "z": "d0c0ffeeb0ffff01",
+    "group": "d0c0ffeeb0grp002",
+    "name": "狀態查詢",
+    "label": "狀態查詢",
+    "order": 6,
+    "width": 0,
+    "height": 0,
+    "emulateClick": false,
+    "tooltip": "",
+    "color": "",
+    "bgcolor": "",
+    "className": "",
+    "icon": "",
+    "iconPosition": "left",
+    "payload": "",
+    "payloadType": "str",
+    "topic": "狀態查詢",
+    "topicType": "str",
+    "buttonColor": "",
+    "textColor": "",
+    "iconColor": "",
+    "enableClick": true,
+    "enablePointerdown": false,
+    "pointerdownPayload": "",
+    "pointerdownPayloadType": "str",
+    "enablePointerup": false,
+    "pointerupPayload": "",
+    "pointerupPayloadType": "str",
+    "x": 320,
+    "y": 560,
+    "wires": [
+      [
+        "d0c0ffeeb1000023"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000023",
+    "type": "subflow:d0c0ffeeb0b30000",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "狀態查詢",
+    "env": [],
+    "x": 700,
+    "y": 560,
+    "wires": [
+      [
+        "d0c0ffeeb1000030"
+      ],
+      [
+        "d0c0ffeeb1000030"
+      ]
+    ]
+  },
+  {
+    "id": "d0c0ffeeb1000030",
+    "type": "debug",
+    "z": "d0c0ffeeb0ffff01",
+    "name": "積木的回覆",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 900,
+    "y": 470,
+    "wires": []
+  }
+]

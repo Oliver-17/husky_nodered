@@ -1,0 +1,19 @@
+# Python 位元碼
+__pycache__/
+*.py[cod]
+
+# colcon 的編譯產物（應該在 workspace 根目錄跑，不是套件目錄裡）
+build/
+install/
+log/
+
+# 測試跑出來的 log（test/sim 的端到端測試會寫在原地）
+test/*.log
+test/sim/*.log
+test/sim/*.xwd
+
+# 編輯器與系統檔
+.vscode/
+*.swp
+*~
+.DS_Store

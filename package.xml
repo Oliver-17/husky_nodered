@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>husky_nodered</name>
+  <version>0.1.0</version>
+  <description>
+    把 Low-Code 任務編排工具接到第二種載具：Clearpath Husky A200（地面無人載具）。
+    只做模擬。編排層與橋接層完全沿用無人機那一套 —— 這個套件存在的目的，
+    就是驗證「換載具不用改 Node-RED、不用改 nodered_ros2」。
+  </description>
+  <maintainer email="oliver.920906@gmail.com">Oliver</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 模擬與橋接。ros_gz_bridge 在這台機器上是 Harmonic 版
+       （ros-humble-ros-gzharmonic-bridge），套件名一樣。 -->
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <!-- GoTo：和無人機共用的服務格式 -->
+  <exec_depend>vehicle_nodered_interfaces</exec_depend>
+  <!-- 倉庫場景的幾何與地圖的唯一來源（世界檔由它的 gen_warehouse.py 產生） -->
+  <exec_depend>drone_nodered</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
