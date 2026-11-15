@@ -128,13 +128,35 @@ for n in nodes:
         if n.get("group") and n["group"] not in groups:
             fails.append(f"⑧ {n.get('name')} 掛在不存在的分區 {n['group']}")
 # ⑧c 版面：三欄那一列（無人機 w4 + 地圖 w4 + 地面車 w4）剛好 12 欄，
-#     指令那一塊 w6 要和無人機的「飛行」同寬才排得整齊。
+#     指令那一塊 w6 要和「無人機指令」同寬才排得整齊。
+#     ⚠️ 2026-11-15 版面改過（Oliver 定的）：中排是「無人機指令(4)｜地面車指令(5)」，
+#        下排是「任務(6)｜模擬(7)」。之前地面車指令是第 6 格，排在「任務」下面。
 st = next((g for g in groups.values() if g["order"] == 3), None)
-cmd = next((g for g in groups.values() if g["order"] == 6), None)
+cmd = next((g for g in groups.values() if g["order"] == 5), None)
 if not st or st["width"] != 4:
     fails.append(f"⑧c 狀態分區應該是 order=3、width=4，實際 {st}")
 if not cmd or cmd["width"] != 6:
-    fails.append(f"⑧c 指令分區應該是 order=6、width=6，實際 {cmd}")
+    fails.append(f"⑧c 指令分區應該是 order=5、width=6，實際 {cmd}")
+
+# ⑧d 地面車要有自己的「追蹤目標」按鈕（2026-11-15）。之前儀表板上唯一那顆
+#     「追蹤目標」打的是**無人機**的 /MAV1/api/track，地面車根本沒有按鈕。
+#     這裡驗：按鈕在地面車指令分區、接到「車：追蹤目標」積木、追蹤 180 秒。
+btn = next((n for n in nodes if n["type"] == "ui-button"
+            and n.get("label") == "追蹤目標"), None)
+if not btn or not cmd or btn.get("group") != cmd["id"]:
+    fails.append("⑧d 地面車指令分區裡沒有「追蹤目標」按鈕")
+else:
+    dst = next((n for n in nodes if n["id"] in btn["wires"][0]), None)
+    if not dst or dst["type"] != "subflow:d0c0ffeeb0b40000":
+        fails.append(f"⑧d「追蹤目標」按鈕沒接到「車：追蹤目標」積木，接到 {dst and dst['type']}")
+    elif {e["name"]: e["value"] for e in dst.get("env", [])}.get("DURATION") != "180":
+        fails.append(f"⑧d 儀表板的追蹤應該是 180 秒，實際 {dst.get('env')}")
+# ⑧e 按鈕文字不要表情符號（2026-11-15 Oliver 要求）
+for n in nodes:
+    if n["type"] == "ui-button" and any(ord(c) >= 0x2190 and not (0x3000 <= ord(c) <= 0x9FFF)
+                                        and not (0xFF00 <= ord(c) <= 0xFFEF)
+                                        for c in n.get("label", "")):
+        fails.append(f"⑧e 按鈕文字有表情符號：{n['label']!r}")
 
 # ⑨ 🔴 寫 husky_status 的那支一定要設 _t（2026-11-15 加）
 #

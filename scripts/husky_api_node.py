@@ -547,7 +547,7 @@ class HuskyApi(Node):
         #      Nav2 回報某個子目標完成時**不能**把整個追蹤任務判成結束，
         #      要讓它繼續下一個。_on_result 會看這個旗標決定怎麼走。
         self._track = {
-            "active": False, "phase": "", "deadline": 0.0,
+            "active": False, "phase": "", "deadline": 0.0, "duration": 0.0,
             "standoff": TRACK_STANDOFF_M,
             "search": [], "search_i": 0,
             "target": None, "target_t": None,   # (x, y) map 與收到的 monotonic
@@ -727,6 +727,12 @@ class HuskyApi(Node):
                     if t["goal"] else None,
             # 正在做哪個復原動作（'' / 轉圈 / 倒車）。儀表板可以顯示。
             "recover": t["recover"],
+            # 已經追了幾秒／總共要追幾秒（2026-11-15，儀表板顯示「42 / 180 秒」用）。
+            # 從 deadline 倒推，不另外記開始時間 —— 兩個來源會不同步。
+            "elapsed_s": (round(max(0.0, time.monotonic()
+                                    - (t["deadline"] - t["duration"])))
+                          if t["active"] else None),
+            "duration_s": round(t["duration"]) if t["active"] else None,
             # 環線繞行方向：'反向'=和目標對頭（找得快）、'同向'=從後面追
             "loop": "同向" if t["loop_step"] < 0 else "反向",
             # True = 跟隨中、由速度控制在開；False = Nav2 在開（搜尋）
@@ -916,6 +922,7 @@ class HuskyApi(Node):
         self._track_cancel()             # 重複呼叫就是重新開始，不是疊加
         self._track.update(
             active=True, phase="搜尋", deadline=time.monotonic() + duration,
+            duration=duration,
             standoff=standoff, search=list(zip(sx, sy)), search_i=0,
             search_started=False,
             goal=None, goal_t=0.0, nav_busy=False, nav_fail=0,

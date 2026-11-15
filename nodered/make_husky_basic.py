@@ -87,8 +87,8 @@ ACTIONS = [
     ("b2", "車：停止", "stop", 10, [], 'msg.payload = {};'),
     ("b3", "車：狀態查詢", "state", 10, [], 'msg.payload = {};'),
     # 追蹤目標（2026-11-14）。和無人機的「追蹤目標」是**同一個服務格式**
-    # （vehicle_nodered_interfaces/Track.srv），但底下的作法不同：
-    # 無人機自己算速度餵 offboard，地面車每次算一個站位點送 Nav2。
+    # （vehicle_nodered_interfaces/Track.srv）。兩台的跟隨都是直接送速度；
+    # 地面車 2026-11-14 那版是每次送站位點給 Nav2，2026-11-15 改掉了。
     #
     # ⚠️ 沒有 ALTITUDE 欄位 —— 地面車沒有高度這個概念。格式裡那個欄位
     #    會被節點忽略，所以不要放上來讓人以為設了有用。
@@ -107,8 +107,8 @@ ACTIONS = [
       # 反向是為了**最快碰到**：47 m 的環線，對頭相遇最久 19 秒，同向要 31 秒。
       #
       # 「那不是會迎面錯身嗎？」—— 碰到之後節點會處理（_check_corner）：
-      #   ① 保持車頭對著目標、一路倒車退（BackUp 不轉向，看得見也不會撞）
-      #   ② 兩台一起退到路口，目標在那裡轉彎
+      #   ① 保持車頭對著目標、一路倒車退（速度控制倒車，車頭照樣對著目標）
+      #   ② 退過路口、停在路口外側讓路，目標在路口轉彎、從車前面過
       #   ③ 目標轉過路口才翻成同向 —— 這時它在遠離，追上去自然在它後面
       # 中間試過「預設就同向」（2026-11-15 早上），實測追不到：同向的相對
       # 追趕速度太慢，60 秒的 duration 根本來不及。
@@ -154,8 +154,11 @@ def action_subflows():
                       f"對應服務 /{NS}/api/{action}。"),
              "category": CATEGORY, "color": "#E6C8A0",
              "in": [{"x": 40, "y": 80, "wires": [{"id": fn_in}]}],
-             "out": [{"x": 560, "y": 40, "wires": [{"id": fn_wait, "port": 0}]},
-                     {"x": 560, "y": 120, "wires": [{"id": fn_wait, "port": 1}]}],
+             # ⚠️ 座標（2026-11-15 拉開）：服務名稱像 /husky/api/track 會把
+             #    節點撐到 200 px 寬，原本 320 / 460 的間距會壓到「等任務完成」。
+             #    改這裡要跑 drone_nodered/test/t_flow_overlap.py。
+             "out": [{"x": 720, "y": 40, "wires": [{"id": fn_wait, "port": 0}]},
+                     {"x": 720, "y": 120, "wires": [{"id": fn_wait, "port": 1}]}],
              "outputLabels": ["完成", "失敗"], "env": env_def},
             {"id": fn_in, "type": "function", "z": sid, "name": "組參數",
              "func": ("const incoming = (msg.payload && typeof msg.payload === 'object')\n"
@@ -174,10 +177,10 @@ def action_subflows():
              "name": f"/{NS}/api/{action}",
              "env": [{"name": "SERVICE", "type": "str", "value": f"/{NS}/api/{action}"},
                      {"name": "TIMEOUT", "type": "num", "value": "10"}],
-             "x": 320, "y": 80, "wires": [[fn_wait]]},
+             "x": 380, "y": 80, "wires": [[fn_wait]]},
             {"id": fn_wait, "type": "function", "z": sid, "name": "等任務完成",
              "func": WAIT_CODE, "outputs": 2, "timeout": 0, "noerr": 0,
-             "initialize": "", "finalize": "", "libs": [], "x": 460, "y": 80,
+             "initialize": "", "finalize": "", "libs": [], "x": 600, "y": 80,
              "wires": [[], []]},
         ]
     return out
@@ -282,7 +285,8 @@ if (!r.platform) { 缺.push("平台"); }
 if (!r.odom) { 缺.push("位置估計"); }
 if (!r.nav2) { 缺.push("導航"); }
 if (!r.bridge) { 缺.push("速度看門狗"); }
-const 就緒 = 缺.length ? ("⏳ 未就緒（等 " + 缺.join("、") + "）") : "✅ 就緒";
+// ❌ 不是 ⏳（2026-11-15 Oliver：未就緒兩台都用同一個符號，不要地面車是沙漏）
+const 就緒 = 缺.length ? ("❌ 未就緒（等 " + 缺.join("、") + "）") : "✅ 就緒";
 // 系統狀態整合在中欄那一行（無人機的 adapter 負責組合），所以這裡不自己顯示，
 // 只把自己那半寫進全域。⚠️ 兩邊的 key 要對上：無人機讀的是 sys_ugv。
 global.set("sys_ugv", 就緒);
@@ -297,7 +301,14 @@ const 位置 = (typeof s.map_x === "number")
     : "位置未知";
 const t = s.task || {};
 let 動作 = "待命";
-if (t.state === "running") {
+const tr = s.track || {};
+if (t.state === "running" && tr.active && typeof tr.elapsed_s === "number") {
+    // 追蹤（2026-11-15）：經過時間 ＋ 節點自己的進度（跟隨中／搜尋中／倒車／讓路…）。
+    // ⚠️ 要排在導航那條**前面**：搜尋階段是 Nav2 在開，nav.state 也是
+    //    running，排後面的話只會看到「剩 X m」，看不出是在追蹤、追多久了。
+    動作 = `${t.name}　${tr.elapsed_s} / ${tr.duration_s} 秒`
+         + (tr.message ? `　${tr.message}` : "");
+} else if (t.state === "running") {
     const n = s.nav || {};
     動作 = (n.state === "running" && typeof n.distance_remaining === "number")
         ? `${t.name}　剩 ${n.distance_remaining.toFixed(1)} m`
@@ -319,12 +330,11 @@ return [{ payload: Number(s.speed_mps) || 0 }, { payload: 位置 },
 
 
 def ui_groups():
-    """兩個分區，位置和無人機那邊對稱：
+    """兩個分區，位置和無人機那邊對稱（2026-11-15 Oliver 定的版面）：
 
         第一列  無人機(order1,w4) │ 地圖(order2,w4) │ 地面車狀態(order3,w4)
-        第二列  飛行(order4,w6)   │ 任務(order5,w6)
-        第三列  地面車指令(order6,w6) │ 模擬(order7,w6)
-        第四列  緊急(order8,w6)
+        第二列  無人機指令(order4,w6) │ 地面車指令(order5,w6)
+        第三列  任務(order6,w6)       │ 模擬(order7,w6)    ← 這兩格要等高
 
     ⚠️ order 和 width 要和 drone_basic.json 裡那四個分區一起看 ——
        12 欄排滿就折行，改一邊會讓另一邊跑位。
@@ -339,16 +349,16 @@ def ui_groups():
     #    見下面 ui_gauge / ui_text 的 height。三欄的元件高度要一起看：
     #        無人機   儀表 6 ＋ 文字 1 ＋ 文字 1
     #        地圖     地圖 7 ＋ 文字 1
-    #        地面車   儀表 6 ＋ 文字 1 ＋ 文字 1
+    #        地面車   儀表 5 ＋ 文字 1 ＋ 文字 2（任務要換行，2026-11-15）
     return [g(GROUP, "地面車（Husky）", 3, 4),
-            g(GROUP_CMD, "地面車指令", 6, 6)]
+            g(GROUP_CMD, "地面車指令", 5, 6)]
 
 
-def ui_text(i, label, order, y, x=900, layout="row-spread", name=None):
+def ui_text(i, label, order, y, x=900, layout="row-spread", name=None, wrap=False, rows=1):
     return {"id": nid(i), "type": "ui-text", "z": TAB, "group": GROUP, "order": order,
-            "width": 0, "height": 1, "name": name or label, "label": label,
+            "width": 0, "height": rows, "name": name or label, "label": label,
             "format": "{{msg.payload}}", "layout": layout, "style": False,
-            "font": "", "fontSize": 16, "color": "#717171", "wrapText": False,
+            "font": "", "fontSize": 16, "color": "#717171", "wrapText": wrap,
             "className": "", "x": x, "y": y, "wires": []}
 
 
@@ -381,8 +391,11 @@ def ui_gauge(i, label, order, y, x=760):
     所以不能直接共用 make_drone_basic 的 ui_gauge。"""
     return {"id": nid(i), "type": "ui-gauge", "z": TAB, "name": label, "group": GROUP,
             "order": order, "value": "payload", "valueType": "msg",
-            # height 6：和無人機那兩個儀表一樣高，三欄才會切齊
-            "width": 0, "height": 6, "gtype": "gauge-half", "gstyle": "needle",
+            # height 5（2026-11-15 從 6 改）：三欄要切齊，每欄合計 8 列 ——
+            #     無人機  儀表 6 ＋ 狀態 1 ＋ 任務 1
+            #     地圖    地圖 7 ＋ 系統狀態 1
+            #     地面車  儀表 5 ＋ 狀態 1 ＋ 任務 2（任務要換行，見 tab_nodes）
+            "width": 0, "height": 5, "gtype": "gauge-half", "gstyle": "needle",
             "title": label, "alwaysShowTitle": True, "floatingTitlePosition": "inside",
             "units": "m/s", "icon": "", "prefix": "", "suffix": "",
             "segments": [{"from": 0, "color": "#5cd65c"}, {"from": 0.8, "color": "#ff8c00"}],
@@ -408,6 +421,7 @@ def tab_nodes():
     sub, split = nid(1), nid(2)
     b_goto, b_home, b_stop, b_state = (nid(0x10), nid(0x11), nid(0x12), nid(0x13))
     i_goto, i_home, i_stop, i_state = (nid(0x20), nid(0x21), nid(0x22), nid(0x23))
+    i_track = nid(0x24)
     out_msg = nid(0x30)
     xy = nid(0x40)
     return [
@@ -433,7 +447,13 @@ def tab_nodes():
          "wires": [[nid(0x100)], [nid(0x101)], [nid(0x102)], [nid(0x200)]]},
         ui_gauge(0x100, "速度", 1, 60, x=760),
         ui_text(0x101, "狀態", 2, 120, x=760),
-        ui_text(0x102, "任務", 3, 180, x=760),
+        # wrap＋兩列高：追蹤時這一行是「追蹤目標　25 / 180 秒　<節點訊息>」，
+        # 不換行會被截成「—…」（2026-11-15 截圖看到，Oliver 要改成換行）。
+        # ⚠️ 光開 wrap 沒用：文字元件高度固定一列（48 px）而且 overflow:hidden，
+        #    內容太長時「任務」標籤佔第一行、內容擠到第二行只剩 24 px，再折下去
+        #    就被切掉（在瀏覽器裡量過 computed style）。所以要給兩列，
+        #    讓出來的那一列從速度儀表扣（見 ui_gauge），三欄才會維持等高。
+        ui_text(0x102, "任務", 3, 180, x=760, wrap=True, rows=2),
         map_link(),
 
         # --- 目標座標輸入 -----------------------------------------------------
@@ -471,6 +491,16 @@ def tab_nodes():
         ui_button(0x13, "狀態查詢", 6, i_state, 560),
         {"id": i_state, "type": f"subflow:{hid('b3')}", "z": TAB, "name": "狀態查詢",
          "env": [], "x": 700, "y": 560, "wires": [[out_msg], [out_msg]]},
+
+        # 追蹤目標（2026-11-15 加到儀表板）。之前儀表板右邊那顆「追蹤目標」
+        # 打的是**無人機**的 /MAV1/api/track，地面車在儀表板上根本沒有按鈕。
+        # ⚠️ 180 秒不是積木的預設 60：實測從生成點開到第一次看到目標就要
+        #    約 30 秒，60 秒只剩半分鐘真的在跟（Oliver 2026-11-15 定的）。
+        #    只改這顆按鈕；積木本身的預設不動，自訂任務裡拉出來的不受影響。
+        ui_button(0x14, "追蹤目標", 7, i_track, 620),
+        {"id": i_track, "type": f"subflow:{hid('b4')}", "z": TAB, "name": "追蹤目標（180 秒）",
+         "env": [{"name": "DURATION", "type": "num", "value": "180"}],
+         "x": 700, "y": 620, "wires": [[out_msg], [out_msg]]},
 
         {"id": out_msg, "type": "debug", "z": TAB, "name": "積木的回覆",
          "active": True, "tosidebar": True, "console": False, "tostatus": False,

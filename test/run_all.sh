@@ -14,6 +14,7 @@ run "Husky 模型一致性（t_husky_model.py）"   python3 "$HERE/t_husky_model
 run "追蹤站位幾何（t_track_geometry.py）"     python3 "$HERE/t_track_geometry.py"
 run "狀態契約（t_status_contract.py）"        python3 "$HERE/t_status_contract.py"
 run "流程結構（t_husky_flow.py）"             python3 "$HERE/t_husky_flow.py"
+run "流程裡沒有積木重疊（t_flow_overlap.py）"   python3 "$HERE/../../drone_nodered/test/t_flow_overlap.py"
 run "地圖 widget 共用（t_map_widget_husky.js）" node "$HERE/t_map_widget_husky.js"
 
 printf '\n'
