@@ -136,6 +136,37 @@ if not st or st["width"] != 4:
 if not cmd or cmd["width"] != 6:
     fails.append(f"⑧c 指令分區應該是 order=6、width=6，實際 {cmd}")
 
+# ⑨ 🔴 寫 husky_status 的那支一定要設 _t（2026-11-15 加）
+#
+#    當初是什麼症狀：串接兩個積木時，第一個做完了下一個永遠不會被呼叫 ——
+#    Nav2 回報 Goal succeeded、服務層也把 task 標成 done，但積木就是不放行，
+#    一路卡到逾時（導航積木 180 秒）才走失敗出口。
+#
+#    原因：每個動作積木的「等任務完成」第一關是
+#        if (!s || !s._t || s._t < t0) return;
+#    狀態是 5 Hz 一直在發的，剛開始等的時候讀到的可能還是「上一個動作」的
+#    結果（已完成），那會讓積木立刻放行。所以它只認「開始等之後才發布」的
+#    那一筆 —— 而那是靠這個時間戳分辨的。沒有 _t 就永遠不成立。
+#
+#    ⚠️ 為什麼值得一條測試：這個漏掉**完全沒有症狀**。手動按單一顆按鈕時
+#    車照樣會動（用不到完成出口），只有串接才會爆。2026-11-07 漏的，
+#    藏到 11/15 才被發現。
+writer = [n for n in nodes
+          if n.get("type") == "function" and "husky_status" in n.get("func", "")
+          and 'global.set("husky_status"' in n.get("func", "")]
+if not writer:
+    fails.append("⑨ 找不到把 /husky/api/status 存進全域 husky_status 的 function")
+for n in writer:
+    code = n["func"]
+    i_t = code.find("s._t")
+    i_set = code.find('global.set("husky_status"')
+    if i_t < 0:
+        fails.append(f"⑨ 「{n.get('name')}」沒有設 s._t —— "
+                     "所有動作積木的完成出口都不會觸發（串接時才會發現）")
+    elif i_t > i_set:
+        fails.append(f"⑨ 「{n.get('name')}」的 s._t 設在 global.set 之後，"
+                     "存進去的那份不會帶到時間戳")
+
 if fails:
     print(f"✗ 流程結構檢查沒過（{len(fails)} 項）：")
     for f in fails:
@@ -143,4 +174,4 @@ if fails:
     sys.exit(1)
 n_sub = len(subflow_ids)
 print(f"✓ 流程結構檢查通過（{len(nodes)} 個節點、{n_sub} 個積木、"
-      "id 不撞號、線都接得到、地圖是複製的、等待完成讀 husky_status）")
+      "id 不撞號、線都接得到、地圖是複製的、等待完成讀 husky_status 且有設 _t）")

@@ -30,9 +30,11 @@ systemctl --user start drone-nodered.service     # 底座：rosbridge + 兩台�
 systemctl --user start drone-warehouse.service   # 場景：Gazebo + PX4 + 兩套 Nav2
 ```
 
-⚠️ **全部就緒要等約 95 秒**（地面車的 Nav2 排在第 70 秒才起，兩套同時
-configure 會卡在 Configuring map_server 而且不會重試）。沒等到就說「未就緒」
-是正常的，不是壞掉。
+⚠️ **全部就緒要等約 65 秒**（2026-11-15 之前是 95 秒）。地面車的 Nav2 改成
+「等無人機的 /navigate_to_pose 出現 + 5 秒」才起，不再固定延後 35 秒 ——
+兩套同時 configure 會卡在 Configuring map_server 而且不會重試，所以一定要錯開，
+但 35 秒是猜的、實測只要 3~4 秒。細節和實測數字見 README 的「兩台同場時
+Nav2 的啟動順序」。沒等到就說「未就緒」是正常的，不是壞掉。
 
 測試：
 

@@ -34,13 +34,16 @@
 import os
 
 import yaml
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import (get_package_prefix,
+                                         get_package_share_directory)
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
-                            LogInfo, TimerAction)
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
+                            IncludeLaunchDescription, LogInfo,
+                            RegisterEventHandler, TimerAction)
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node, PushRosNamespace
 from launch.actions import GroupAction
 
@@ -50,7 +53,11 @@ DRONE_SHARE = get_package_share_directory("drone_nodered")
 #（兩套 Nav2 不能同時 configure —— 見 both_all 的檔頭）。
 NAV2_DELAY = 12.0          # 要蓋過 gz 載入世界 + bridge 延後 5 秒
 API_DELAY = 20.0           # 服務層要等 Nav2 的 action server 出現
+VISION_DELAY = 8.0         # 相機橋接要等 gz 把世界載完、感測器開始發
 
+# 等待用的小程式（裝在 lib/<pkg>/ 底下，不是 share/）
+GATE_SCRIPT = os.path.join(get_package_prefix("husky_nodered"),
+                           "lib", "husky_nodered", "wait_for_action.py")
 PARAMS = os.path.join(HUSKY_SHARE, "config", "warehouse_nav2_husky.yaml")
 MAP_YAML = os.path.join(DRONE_SHARE, "maps", "warehouse.yaml")
 GEOM = os.path.join(DRONE_SHARE, "config", "warehouse_geometry.yaml")
@@ -86,7 +93,9 @@ def generate_launch_description():
     # ⚠️ 推進 /husky 命名空間：兩台載具同場時，planner_server／controller_server
     #    這些節點名會撞。參數檔的頂層 key 也跟著加了 /husky/ 前綴 ——
     #    沒跟著改的話節點會安靜地套用預設值（見參數檔檔頭）。
-    nav2 = GroupAction([PushRosNamespace("husky"), IncludeLaunchDescription(
+    def make_nav2():
+        """每次呼叫都產生一份新的 —— 同一個 action 物件不能掛在兩個地方。"""
+        return GroupAction([PushRosNamespace("husky"), IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory("drone_control"), "launch", "nav2.launch.py")),
         launch_arguments={
@@ -101,8 +110,47 @@ def generate_launch_description():
             "goal_tool": "false",
         }.items())])
 
+    # ── Nav2 什麼時候起：等事件，不要用猜的 ──────────────────────────────
+    # 兩套 Nav2 不能同時 configure（後起的會卡在 Configuring map_server，
+    # 而且不會自己重試）。原本是「地面車延後 35 秒」硬等，但實測每套 Nav2
+    # 只要 3~4 秒就緒 —— 那 35 秒裡有 31 秒純浪費，而且機器更忙時反而可能不夠。
+    #
+    # 傳了 wait_for_action 就改成「等那個 action server 出現 + settle 幾秒」。
+    # 沒傳（單獨跑地面車，沒有別的 Nav2 要讓）就維持原本的計時器。
+    wait_for = LaunchConfiguration("wait_for_action")
+    has_wait = PythonExpression(["'", wait_for, "' != ''"])
+
+    gate = ExecuteProcess(
+        cmd=[GATE_SCRIPT, wait_for,
+             "--settle", LaunchConfiguration("nav2_settle"),
+             "--timeout", LaunchConfiguration("nav2_wait_timeout")],
+        condition=IfCondition(has_wait), output="screen")
+
+    nav2_by_event = RegisterEventHandler(
+        OnProcessExit(target_action=gate, on_exit=[
+            LogInfo(msg="--- ③ 開 Nav2（差速車參數）—— 等到對方的 Nav2 好了 ---"),
+            make_nav2(),
+        ]))
+
+    # 前視相機 + 偵測。延後 VISION_DELAY 是因為它要等 Gazebo 把世界載完
+    # ——相機話題還沒出現時 bridge 會安靜地接不到東西（不會重試、不會報錯）。
+    vision = TimerAction(period=VISION_DELAY, actions=[
+        LogInfo(msg="--- 開前視相機與偵測 ---"),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(HUSKY_SHARE, "launch", "husky_vision.launch.py")),
+            condition=IfCondition(LaunchConfiguration("vision")),
+            launch_arguments={
+                "detector": LaunchConfiguration("detector"),
+            }.items()),
+    ])
+
     return LaunchDescription([
         DeclareLaunchArgument("gui", default_value="true"),
+        DeclareLaunchArgument("vision", default_value="false",
+                              description="開前視相機與偵測（/husky/detections）"),
+        DeclareLaunchArgument("detector", default_value="",
+                              description="color / yolo。留空 = 讀世界檔自動選"),
         DeclareLaunchArgument("start_gz", default_value="true",
                               description="false = 不開 Gazebo（同場時由 PX4 那邊開）"),
         DeclareLaunchArgument("nav2_delay", default_value=str(NAV2_DELAY)),
@@ -110,13 +158,32 @@ def generate_launch_description():
         DeclareLaunchArgument("husky_api", default_value="true",
                               description="false = 服務層由底座提供"),
         DeclareLaunchArgument("rviz", default_value="false"),
+        # 空字串 = 用 nav2_delay 計時（單獨跑地面車）。
+        # 填一個 action 名稱 = 等那個 action server 出現才起 Nav2（兩台同場）。
+        DeclareLaunchArgument(
+            "wait_for_action", default_value="",
+            description="等這個 action server 出現才開 Nav2，例如 /navigate_to_pose。"
+                        "留空 = 用 nav2_delay 計時"),
+        DeclareLaunchArgument(
+            "nav2_settle", default_value="5.0",
+            description="看到對方的 action 之後再等幾秒 —— Nav2 的 action server "
+                        "是 on_configure 就建立的，看得到不代表 activate 完了"),
+        DeclareLaunchArgument(
+            "nav2_wait_timeout", default_value="120.0",
+            description="等不到就放棄、照常開 Nav2（對方沒起來就沒有搶 configure 的問題）"),
         LogInfo(msg="--- ① 開 Gazebo（倉庫 + Husky）與 bridge ---"),
         sim,
         LogInfo(msg=f"--- ② 發 map → odom 的靜態 TF（單位變換；車子 spawn 在 {sx}, {sy}）---"),
         map_to_odom,
-        TimerAction(period=LaunchConfiguration("nav2_delay"), actions=[
+        vision,
+        # ③ 兩條路二擇一（見上面 gate 的說明）：
+        #    有傳 wait_for_action → 等事件；沒傳 → 原本的計時器
+        gate,
+        nav2_by_event,
+        TimerAction(period=LaunchConfiguration("nav2_delay"),
+                    condition=UnlessCondition(has_wait), actions=[
             LogInfo(msg="--- ③ 開 Nav2（差速車參數）---"),
-            nav2,
+            make_nav2(),
         ]),
         # ⚠️ 服務層預設**不在這裡開**：它屬於常駐的底座
         #    （drone_nodered 的 nodered_all.launch.py，和 drone_api_node 並列）。

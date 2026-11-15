@@ -6,11 +6,23 @@
         https://app.gazebosim.org/OpenRobotics/fuel/models/Clearpath Robotics Husky A200
         授權：CC0 1.0（公眾領域，無須標示，但還是記著出處比較好追）
 
-  ⚠️ 這份是「改過的」原廠模型，改了三處，都記在下面：
+  ⚠️ 這份是「改過的」原廠模型，改了五處，都記在下面：
       1. <sdf version> 1.5 → 1.8
       2. 移除四個 joint 的 <use_parent_model_frame>（1.8 已廢棄；輪子 pose 沒有
          旋轉，所以移除前後語意完全相同）
       3. husky_diff_controller（Gazebo-classic 的 ROS 1 外掛）→ gz-sim 的 DiffDrive
+      4. **新增** OdometryPublisher（原廠模型沒有這個插件）。原廠包裡只有
+         幾何、外觀、慣量和 joint —— 原廠這台車身上一個感測器都沒有，
+         「知道自己在哪」整件事是外面接上去的，不是模型自帶的。
+      5. **新增** 前視相機（2026-11-13）：柱子 + RGB + 深度，追蹤目標車用。
+         詳細幾何與為什麼是這個角度，見下面 camera_link 前的那段註解。
+         ⚠️ 它仍然**沒有光達** —— 目前 warehouse_nav2_husky.yaml 的障礙物層
+         訂閱的是無人機的 /MAV1/scan，所以「只有地面車」的場景看不到
+         動態障礙物。那是另一件待辦，不在這次的範圍。
+
+  也就是說，下載包提供的是 mesh／collision／inertial／joint 與輪距輪徑；
+  「會動」（DiffDrive）和「知道自己在哪」（OdometryPublisher）兩個插件都是
+  gz-sim 內建的，由這份檔案掛上去，不屬於 Husky 本身。
 
   車體幾何（給 Nav2 的 footprint 用，不要再去查別的規格表）：
       輪距 0.5709 m   輪半徑 0.17775 m   車體約 0.99 x 0.67 m
@@ -368,6 +380,173 @@
         </ode>
       </physics>
     </joint>
+    <!-- ───────────────────────────────────────────────────────────────────────
+         前視相機（2026-11-13 新增）—— 追蹤目標車用
+
+         原廠模型一個感測器都沒有（見檔頭），這是外加的第一個。
+
+         === 為什麼要一根柱子，不能直接放在車頂 ===
+         車體頂面在 base_link z=0.234（collision 盒 pose 0.1 + 半高 0.13375），
+         而車體往前一直延伸到 x=0.5037。相機若貼著車頂放，**自己的車頂會吃掉
+         半個畫面**：相機離車頂只有幾公分，往下看的光線很快就打到頂板。
+         實算過：相機放在 (0.30, z=0.26) 時，俯角超過 7.3° 的光線全部打在
+         自己的頂板上 —— 垂直視角 54° 裡有 55% 是自己的車。
+
+         所以把相機抬到 z=0.45（柱子從頂板 0.234 升上去），並且**往前伸 0.05**
+         懸在柱子外面：
+             柱子   x=0.30、0.03 見方、z 0.234~0.450
+             相機   x=0.35、z=0.450          ← 比柱子前緣(0.315)還前面 0.035
+         相機懸出來是必要的 —— 和柱子同一個 x 的話，往下 37° 的光線會從
+         柱子頂端的側面穿出去，畫面下緣會有一條柱子。
+
+         === 離地高度 ===
+             模型原點離地 0.14275（檔頭記的）
+             相機光心     base_link z=0.450  →  **離地 0.593 m**
+
+         === 俯角 10°（= 0.17453 rad，繞 y 軸，往下為正）===
+         垂直半視角 27.2°（水平 FOV 1.204 rad，640x480 推出來的），所以看得到
+         水平線上方 17.2° 到下方 37.2°。
+
+         這個角度是照「目標車要落在畫面中央」挑的。目標車 hatchback_target
+         車高 0.235、中心離地 0.1175，相機比它高 0.4755 m：
+
+             距離      目標中心的俯角    在畫面的位置
+             1.5 m        17.6°         中心下方 7.6°
+             2.7 m        10.0°         **正中央**
+             5.0 m         5.4°         中心上方 4.6°
+             8.0 m         3.4°         中心上方 6.6°
+             水平線        0.0°         中心上方 10.0°
+
+         也就是 1.5~8 m 全程都在中心上下 7.6° 以內（半視角是 27.2°），
+         不用動相機就追得到。純水平（0°）的話同樣距離會偏到中心下方
+         12%~65%，而且有一半畫面在拍 7 m 高的屋頂 —— 對 YOLO 是純浪費。
+
+         === 兩個邊界，知道就好 ===
+         ① 車體自遮的餘裕：要俯角 54.5° 才看得到自己的車頂
+            （頂板低 0.216、車頭在前方 0.154 → atan(0.216/0.154)），
+            而最大俯角只有 37.2°，**餘裕 17.3°**。
+            ⚠️ 相機往下移或往後縮都會吃掉這個餘裕。
+         ② 近處盲區：最下緣的光線在相機前方 0.78 m 打到地面，
+            換算成**車頭前方 0.63 m**。追 2~8 m 的目標用不到這一段。
+         ③ 橫向覆蓋：水平半視角 34.5°，5 m 處是 ±3.44 m（走道寬度夠）。
+
+         === ⚠️ gz_frame_id 為什麼是 husky/camera_optical ===
+         兩個理由，缺一個都會出錯：
+
+         ① **光學慣例**。影像訊息的 frame_id 會原封不動傳到下游：
+            偵測框 → target_locator_node → target_point。而那顆節點輸出的
+            是**光學座標**（x 右、y 下、z 前，target_locator_node.py:147-149）。
+            ROS 的慣例裡 camera_link 是 x 前、y 左、z 上 —— 兩者差一個 90°。
+            叫 camera_link 的話，任何拿 TF 去換算的人都會整個轉 90°，
+            **而且不會報錯**，只會發現目標位置垂直於它該在的方向。
+            ⚠️ 無人機那條鏈沒中這個雷，是因為它根本沒用 TF
+               （target_world_node 自己拿 PX4 姿態硬算）。不要照抄它的命名。
+
+         ② **husky/ 前綴**。兩台載具同場時 TF 樹不能有同名的框
+            （base_link、odom 都已經加了前綴，見 ③d 的測試）。
+
+         實際的 TF 由 launch 的靜態變換發（husky_vision.launch.py）：
+             husky/base_link → husky/camera_link      實體安裝（這裡的 pose）
+             husky/camera_link → husky/camera_optical  標準光學旋轉
+         ⚠️ 改這個 link 的 <pose> 要同時改 launch 裡第一條靜態變換，
+            兩邊不一致**不會報錯**，只會讓算出來的目標位置固定偏掉。
+
+         === ⚠️ gz 話題名一定要和無人機分開 ===
+         無人機的深度相機在 x500_cam_down/model.sdf:154 寫死
+         <topic>depth_camera</topic> —— 那是 **gz 的全域話題名，不帶模型路徑**。
+         Husky 照抄的話兩台會發同一個話題，橋接收到的是混在一起的資料，
+         而且不會有任何錯誤訊息。所以這裡兩顆都明確寫 /husky/... 開頭。
+
+         明確寫 <topic> 的另一個好處：不用像無人機那樣去組
+         /world/<世界>/model/<機體>/link/<連桿>/sensor/<感測器>/image 這種長路徑，
+         換世界名或改模型名時 launch 不會跟著壞。
+         ────────────────────────────────────────────────────────────────────── -->
+    <link name="cam_mast_link">
+      <pose relative_to="base_link">0.30 0 0.342 0 0 0</pose>
+      <!-- 0.2 kg 對 base_link 的 33.855 kg 是 0.6%，可以忽略；
+           但不要給 0 —— Gazebo 對零質量的 link 會抱怨。 -->
+      <inertial>
+        <mass>0.2</mass>
+        <inertia><ixx>1e-3</ixx><iyy>1e-3</iyy><izz>1e-4</izz></inertia>
+      </inertial>
+      <visual name="mast_visual">
+        <geometry><box><size>0.03 0.03 0.216</size></box></geometry>
+        <material>
+          <ambient>0.15 0.15 0.15 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse>
+        </material>
+      </visual>
+    </link>
+    <joint name="CamMastJoint" type="fixed">
+      <parent>base_link</parent>
+      <child>cam_mast_link</child>
+    </joint>
+
+    <link name="camera_link">
+      <!-- 0.17453 rad = 10°，繞 y 軸往下為正。改這個數字要回去看上面的表。 -->
+      <pose relative_to="base_link">0.35 0 0.45 0 0.17453 0</pose>
+      <inertial>
+        <mass>0.1</mass>
+        <inertia><ixx>1e-4</ixx><iyy>1e-4</iyy><izz>1e-4</izz></inertia>
+      </inertial>
+      <visual name="camera_visual">
+        <geometry><box><size>0.03 0.09 0.02</size></box></geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- RGB。參數刻意和無人機那顆一致（1.204 rad / 640x480 / 15 Hz），
+           這樣同一組偵測器參數在兩台上的行為可以直接比較。 -->
+      <sensor name="front_rgb" type="camera">
+        <gz_frame_id>husky/camera_optical</gz_frame_id>
+        <!-- 光心和 camera_link 原點重合，下游算幾何時不用再扣偏移。 -->
+        <pose>0 0 0 0 0 0</pose>
+        <topic>husky/rgb/image</topic>
+        <camera>
+          <horizontal_fov>1.204</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>100</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>15</update_rate>
+        <visualize>true</visualize>
+      </sensor>
+
+      <!-- 深度。地面車的相機是**水平**的，所以下游不能用無人機那套
+           「射線和地面平面求交點」—— 近乎平行的射線求交點，車身一顛
+           算出來的距離就從 5 m 跳到 50 m。地面車必須靠深度。
+           far 19.1 沿用無人機那顆的值（StereoOV7251 的規格）。 -->
+      <sensor name="front_depth" type="depth_camera">
+        <gz_frame_id>husky/camera_optical</gz_frame_id>
+        <pose>0 0 0 0 0 0</pose>
+        <topic>husky/depth/image</topic>
+        <camera>
+          <horizontal_fov>1.274</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+          </image>
+          <clip>
+            <near>0.2</near>
+            <far>19.1</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>15</update_rate>
+        <visualize>false</visualize>
+      </sensor>
+    </link>
+    <joint name="CameraJoint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+    </joint>
+
     <!-- ───────────────────────────────────────────────────────────────────────
          原廠模型帶的是 Gazebo-classic 的 ROS 1 外掛（libhusky_gazebo_plugins.so），
          Harmonic 載不動，所以換成 gz-sim 內建的 DiffDrive。

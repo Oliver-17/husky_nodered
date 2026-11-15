@@ -11,6 +11,7 @@ install(DIRECTORY gz launch config docs
 install(PROGRAMS
         scripts/cmd_vel_watchdog.py
         scripts/husky_api_node.py
+        scripts/wait_for_action.py
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

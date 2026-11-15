@@ -58,6 +58,24 @@ def generate_launch_description():
         os.pathsep.join([os.path.join(HUSKY_SHARE, "gz", "models"),
                          os.path.join(DRONE_SHARE, "gz", "models")]))
 
+    # ⚠️ 感測器要靠這個才會被算（2026-11-13）。
+    #    Gazebo 的 system plugin 清單在世界檔沒寫 <plugin> 時，是從
+    #    ~/.gz/sim/8/server.config 來的 —— 那份**只有** Physics、UserCommands、
+    #    SceneBroadcaster，沒有 Sensors。相機和光達完全不會被算。
+    #
+    #    PX4 開 Gazebo 時用的是它自己那份（有 Sensors），所以「兩台同場」
+    #    看不出問題；只有在這裡自己開 Gazebo 時才會中。
+    #
+    #    而且是**靜默失敗**：ros_gz_bridge 照樣建立 /husky/rgb/image 這個 ROS
+    #    話題，ros2 topic list 看得到，只是永遠零筆資料，沒有任何錯誤訊息。
+    #    判定法：ros2 topic hz /husky/rgb/image 完全沒有輸出。
+    #
+    #    為什麼不把 <plugin> 寫進世界檔：世界檔和 PX4 共用，寫進去會讓
+    #    PX4 那條路載入兩次 Sensors。環境變數只影響這裡開的 Gazebo。
+    server_config = SetEnvironmentVariable(
+        "GZ_SIM_SERVER_CONFIG_PATH",
+        os.path.join(HUSKY_SHARE, "gz", "config", "server.config"))
+
     # -r = 直接開始跑（不要停在暫停）；-s = 只有 server，不開畫面
     # start_gz=false：兩台載具同場時 Gazebo 由 PX4 那邊開（start_empty_sitl.sh），
     # 這裡只負責 bridge 與看門狗，絕對不能再開一個 —— 兩個 gz server 會各跑
@@ -106,6 +124,7 @@ def generate_launch_description():
         DeclareLaunchArgument("world", default_value=WORLD,
                               description="世界檔路徑（預設是產生器寫出來的那份）"),
         res_path,
+        server_config,
         gz_gui,
         gz_headless,
         watchdog,
