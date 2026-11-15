@@ -1159,7 +1159,7 @@
     "value": "payload",
     "valueType": "msg",
     "width": 0,
-    "height": 5,
+    "height": 6,
     "gtype": "gauge-half",
     "gstyle": "needle",
     "title": "速度",

@@ -347,9 +347,9 @@ def ui_groups():
     # ⚠️ 2026-11-08：分區的 height **沒有作用** —— Dashboard 2.0 的分區高度
     #    是由內容撐出來的（設 9 之後三欄還是不齊）。要等高得調**元件**的高度，
     #    見下面 ui_gauge / ui_text 的 height。三欄的元件高度要一起看：
-    #        無人機   儀表 6 ＋ 文字 1 ＋ 文字 1
-    #        地圖     地圖 7 ＋ 文字 1
-    #        地面車   儀表 5 ＋ 文字 1 ＋ 文字 2（任務要換行，2026-11-15）
+    #        無人機   儀表 6 ＋ 文字 1 ＋ 文字 2
+    #        地圖     地圖 7 ＋ 文字 2
+    #        地面車   儀表 6 ＋ 文字 1 ＋ 文字 2（2026-11-15 任務／系統狀態改成可換行）
     return [g(GROUP, "地面車（Husky）", 3, 4),
             g(GROUP_CMD, "地面車指令", 5, 6)]
 
@@ -391,11 +391,12 @@ def ui_gauge(i, label, order, y, x=760):
     所以不能直接共用 make_drone_basic 的 ui_gauge。"""
     return {"id": nid(i), "type": "ui-gauge", "z": TAB, "name": label, "group": GROUP,
             "order": order, "value": "payload", "valueType": "msg",
-            # height 5（2026-11-15 從 6 改）：三欄要切齊，每欄合計 8 列 ——
-            #     無人機  儀表 6 ＋ 狀態 1 ＋ 任務 1
-            #     地圖    地圖 7 ＋ 系統狀態 1
-            #     地面車  儀表 5 ＋ 狀態 1 ＋ 任務 2（任務要換行，見 tab_nodes）
-            "width": 0, "height": 5, "gtype": "gauge-half", "gstyle": "needle",
+            # height 6：三欄要切齊，每欄合計 9 列（2026-11-15 三欄的文字都改成可換行）——
+            #     無人機  儀表 6 ＋ 狀態 1 ＋ 任務 2
+            #     地圖    地圖 7 ＋ 系統狀態 2
+            #     地面車  儀表 6 ＋ 狀態 1 ＋ 任務 2
+            # ⚠️ 不要用「縮地圖」換空間：地圖 6 列時底下那行說明會被擠出去、出現捲軸。
+            "width": 0, "height": 6, "gtype": "gauge-half", "gstyle": "needle",
             "title": label, "alwaysShowTitle": True, "floatingTitlePosition": "inside",
             "units": "m/s", "icon": "", "prefix": "", "suffix": "",
             "segments": [{"from": 0, "color": "#5cd65c"}, {"from": 0.8, "color": "#ff8c00"}],
@@ -451,8 +452,8 @@ def tab_nodes():
         # 不換行會被截成「—…」（2026-11-15 截圖看到，Oliver 要改成換行）。
         # ⚠️ 光開 wrap 沒用：文字元件高度固定一列（48 px）而且 overflow:hidden，
         #    內容太長時「任務」標籤佔第一行、內容擠到第二行只剩 24 px，再折下去
-        #    就被切掉（在瀏覽器裡量過 computed style）。所以要給兩列，
-        #    讓出來的那一列從速度儀表扣（見 ui_gauge），三欄才會維持等高。
+        #    就被切掉（在瀏覽器裡量過 computed style）。所以要給兩列；
+        #    三欄的列數要一起看，見 ui_gauge。
         ui_text(0x102, "任務", 3, 180, x=760, wrap=True, rows=2),
         map_link(),
 
