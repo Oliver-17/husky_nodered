@@ -145,14 +145,26 @@ TRACK_CMD_HZ = 10.0          # cmd_vel 的發送頻率。看門狗 2 秒逾時�
 #    比例控制的平衡點是「誤差大到 kp×誤差 = 目標速度」才跟得住：
 #        kp 0.8、目標 0.5 m/s → 要落後 0.625 m 才給得出 0.5 m/s
 #    實測就是這樣：相距 3.5 m（站位 3.0）時速度只給 0.40，比目標還慢，
-#    於是一路被拉開。kp 2.0 之下只要落後 0.25 m 就給得出 0.5 m/s，
-#    落後 0.5 m 就直接滿速 1.0。
+#    於是一路被拉開。kp 2.0 之下只要多落後 0.25 m 就給得出 0.5 m/s，
+#    多落後 0.5 m 就直接滿速 1.0。
+#    （「多落後」是指超出不動區 0.3 m 的部分 —— 2026-11-16 起不動區邊緣
+#      改成連續的，見 dist_speed。所以目標 0.5 m/s 時實際落後約 0.55 m。）
 #    不怕衝過頭：v 有上限 1.0，而且太近時 e_d 變負的會自動倒車。
 TRACK_KP_LIN = 2.0           # 距離誤差（m）→ 前進速度（m/s）
 TRACK_KP_YAW = 1.5           # 方位誤差（rad）→ 角速度（rad/s）。抄無人機的值
 TRACK_MAX_SPEED = 1.0        # 前進上限。車體本身就是 1.0（A200 原廠上限）
 TRACK_MAX_YAWRATE = 1.0      # 角速度上限。和 Nav2 的 max_vel_theta 一致
 TRACK_SPEED_DEADBAND_M = 0.3 # 距離誤差小於這個就不動，免得一直來回修
+# ⚠️ 不動區的**邊緣必須是連續的**（2026-11-16 修，見 dist_speed）。
+#    舊版是「誤差 < 0.3 → 0；≥ 0.3 → 2.0 × 誤差」，一跨過邊緣就從 0 跳到 0.6 m/s。
+#    而目標以 0.5 m/s 走時，要跟上只需要落後 0.5 / 2.0 = 0.25 m —— 平衡點
+#    剛好落在不動區**裡面**，於是「停 → 被拉開 → 衝 0.6 → 又停」，
+#    測試小模擬量到 30 秒切換 85 次。Oliver 看到的「跟隨中／已就位來回跳」
+#    就是這個，車本身也在頓。
+# 跟隨訊息的「已就位／跟隨中／倒車」要維持這麼久才換（見 hold_kind）。
+# 為什麼要：目標位置有偵測雜訊（±0.1~0.2 m），即使控制已經連續，
+# 距離在 0.3 m 邊緣附近晃時文字還是會閃。1 秒短到不會誤導，長到看得清楚。
+TRACK_MSG_HOLD_S = 1.0
 # 方位誤差超過這個就**只轉頭不前進**。90° 以上往前開等於朝反方向跑。
 TRACK_YAW_ONLY_RAD = 1.2     # ≈ 69°
 
@@ -230,6 +242,41 @@ def wrap_pi(a):
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def dist_speed(e_d, kp, deadband):
+    """距離誤差 → 速度（未夾上限）。不動區裡是 0，出了不動區從 0 **連續**往上長。
+
+        舊：v = kp × e_d               （|e_d| ≥ 0.3 時）→ 邊緣從 0 跳到 0.6
+        新：v = kp × (|e_d| − 0.3) × 正負號      → 邊緣是 0，沒有跳
+
+    代價：跟著移動目標時會多落後一個不動區的寬度。目標 0.5 m/s 時
+    平衡在 0.3 + 0.5/2.0 = 0.55 m（車停在離目標約 3.55 m），
+    在站位距離的 ±0.5 m 容許附近，而且比「每半秒停一次」好得多。
+    """
+    if abs(e_d) < deadband:
+        return 0.0
+    return kp * (e_d - math.copysign(deadband, e_d))
+
+
+def hold_kind(st, kind, now, hold_s, immediate=False):
+    """訊息種類的防抖：新種類要連續出現 hold_s 秒才換上去。回傳現在該顯示的種類。
+
+    st 是呼叫端保存的 dict（shown / pend / pend_t），每趟追蹤開始時清空。
+    immediate=True 的種類（擋牆、太靠近）馬上換：那是安全資訊，晚一秒看到沒有好處。
+    抽成純函式是為了在測試裡用假時鐘驗，不用等真的一秒。
+    """
+    if immediate or st.get("shown") is None:
+        st.update(shown=kind, pend=None)
+        return kind
+    if kind == st["shown"]:
+        st["pend"] = None                   # 晃回來了，候選作廢、重新計時
+        return kind
+    if st.get("pend") != kind:
+        st.update(pend=kind, pend_t=now)
+    if now - st["pend_t"] >= hold_s:
+        st.update(shown=kind, pend=None)
+    return st["shown"]
+
+
 def follow_cmd(dist, e_yaw, standoff, kp_lin, kp_yaw,
                max_fwd, max_back, max_yawrate, deadband):
     """跟隨的控制律（差速車）。回傳 (前進速度 v, 角速度 w)。
@@ -244,7 +291,7 @@ def follow_cmd(dist, e_yaw, standoff, kp_lin, kp_yaw,
     e_d = dist - standoff
     if abs(e_d) < deadband or abs(e_yaw) > TRACK_YAW_ONLY_RAD:
         return 0.0, w                       # 只轉頭不前進
-    v = kp_lin * e_d * math.cos(e_yaw)
+    v = dist_speed(e_d, kp_lin, deadband) * math.cos(e_yaw)
     lim = max_fwd if v > 0 else max_back
     return max(-lim, min(lim, v)), w
 
@@ -365,8 +412,15 @@ def clamp_motion(p, v, walls, area, wall_h, area_h):
 def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
                  max_yawrate, deadband, walls=(), area=None,
                  wall_margin=TRACK_WALL_MARGIN_M, rot_clear=TRACK_ROT_CLEAR_M,
-                 wall_h=TRACK_WALL_LOOKAHEAD_S, area_h=TRACK_POCKET_LOOKAHEAD_S):
+                 wall_h=TRACK_WALL_LOOKAHEAD_S, area_h=TRACK_POCKET_LOOKAHEAD_S,
+                 aim=None, gap=None):
     """跟隨控制律 ＋ 擋牆（差速車）。回傳 (v, w, why)。
+
+    aim / gap（2026-11-16，沿足跡跟用，見 trail_plan）：
+        aim  往哪個點開（足跡上車前方的點）。None = 直接朝 tgt
+        gap  距離誤差改用這個（沿路距離）。None = 用到 tgt 的直線距離
+        停著不動（距離誤差在不動區裡）時車頭**還是對著 tgt**，相機才看得到目標。
+        兩個都不給時和以前完全一樣（測試⑰釘住）。
 
     why：None / 'wall'（沿牆或被牆擋）/ 'area'（退到路口外側）/ 'close'（太靠近，先移開）
     walls 是**原始**方框（貨架與牆的實際邊界），加大由這裡做。
@@ -407,17 +461,24 @@ def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
             return v, 0.0, "close"
 
     walls = inflate_boxes(walls, wall_margin)
-    dx, dy = tgt[0] - p[0], tgt[1] - p[1]
+    e_tgt = wrap_pi(math.atan2(tgt[1] - p[1], tgt[0] - p[0]) - yaw)
+    if aim is not None and math.dist(aim, p) > 1e-6:
+        dx, dy = aim[0] - p[0], aim[1] - p[1]
+    else:
+        dx, dy = tgt[0] - p[0], tgt[1] - p[1]
     dist = math.hypot(dx, dy)
     e_t = wrap_pi(math.atan2(dy, dx) - yaw)
-    v, w = follow_cmd(dist, e_t, standoff, kp_lin, kp_yaw,
+    d_err = gap if gap is not None else math.dist(tgt, p)
+    v, w = follow_cmd(d_err, e_t, standoff, kp_lin, kp_yaw,
                       max_fwd, max_back, max_yawrate, deadband)
-    e_d = dist - standoff
+    e_d = d_err - standoff
     if abs(e_d) < deadband or dist < 1e-6:
+        if aim is not None:              # 停著時看目標，不是看足跡
+            w = max(-max_yawrate, min(max_yawrate, kp_yaw * e_tgt))
         return v, w, None                    # 只轉頭（上面已確定轉頭不會掃到）
 
     # ① ②
-    s = max(-max_back, min(max_fwd, kp_lin * e_d))
+    s = max(-max_back, min(max_fwd, dist_speed(e_d, kp_lin, deadband)))
     want = (s * dx / dist, s * dy / dist)
     got, why = clamp_motion(p, want, walls, area, wall_h, area_h)
 
@@ -486,6 +547,137 @@ def next_wp(leg, step, n):
     step=-1 反著走       → 下一個是這段的**起點** pts[leg]
     """
     return (leg + 1) % n if step > 0 else leg % n
+
+
+# =============================================================================
+#  沿著目標走過的路跟（2026-11-16）
+#
+#  Oliver 回報：「只要到轉角，地面車一定會轉到快要撞牆、一直調整，導致目標不見」。
+#  實測紀錄（同日 SITL 120 秒）：直線走道上穩穩維持 3.5 m；目標在 (0,9) 轉往東
+#  之後，車直接朝目標斜衝，貼著貨架頂邊（y≈7.85）滑了 20 秒，訊息在「沿著貨架
+#  或牆走」和「先轉頭」之間切換，速度只剩 0.1~0.3，期間跟丟 3 次。
+#
+#  原因：follow_world 永遠朝「目標現在的位置」直線開。目標一轉彎，那條直線就
+#  穿過貨架角；擋牆只能砍掉朝牆的分量，所以車貼著貨架滑，車頭被帶偏，前視
+#  相機（±35°）就看不到目標了。
+#
+#  改法：把目標看到過的位置記成一條足跡，車**沿足跡**走（循跡）。目標走過的
+#  地方本來就能通行，沿著走就不會切過貨架角，而且不需要事先知道環線長怎樣。
+#  擋牆保留，但只當最後的保險。
+#
+#  下面全是純函式，測試（t_track_geometry.py ㉘~㉛）直接呼叫。
+# =============================================================================
+TRAIL_STEP_M = 0.3        # 目標每移動這麼多才記一點。太密會把偵測雜訊也記進去
+TRAIL_MAX_M = 25.0        # 足跡最多留多長。環線 47 m，留太長頭尾會在轉角附近靠近
+TRAIL_RESET_M = 2.5       # 新的點離足跡尾巴超過這麼遠 = 不是同一段路（重新開始記）
+TRAIL_FILTER_S = 0.3      # 偵測位置的低通時間常數。0.5 m/s 時落後約 0.15 m
+TRAIL_LOOKAHEAD_M = 1.5   # 瞄準足跡上車前方多遠的點。太短會蛇行，太長會切角
+TRAIL_ON_M = 1.0          # 車離足跡多近才算「在足跡上」（跟隨時）
+TRAIL_CHASE_ON_M = 2.0    # 跟丟後沿足跡開時放寬一點（擋牆可能把車推離足跡）
+TRAIL_HEADING_M = 1.5     # 用足跡尾巴這麼長的一段估目標往哪走
+
+
+def trail_add(trail, pt, step=TRAIL_STEP_M, max_len=TRAIL_MAX_M, reset=TRAIL_RESET_M):
+    """把目標的新位置加進足跡（就地修改）。回傳 True = 足跡重新開始了。"""
+    if trail and math.dist(trail[-1], pt) > reset:
+        trail[:] = [pt]
+        return True
+    if not trail or math.dist(trail[-1], pt) >= step:
+        trail.append(pt)
+        # 從頭砍到總長不超過 max_len
+        total = sum(math.dist(a, b) for a, b in zip(trail, trail[1:]))
+        while len(trail) > 2 and total > max_len:
+            total -= math.dist(trail[0], trail[1])
+            trail.pop(0)
+    return False
+
+
+def trail_project(trail, p):
+    """車投影到足跡上：回傳 (離足跡多遠, 投影點的弧長位置, 足跡總長)。
+
+    ⚠️ 距離一樣時取**後面**的那一段（<=）：轉角處兩段等距，取後面的才不會
+       被判成「還在轉角前」而往回瞄。
+    """
+    best_d, best_s, cum = float("inf"), 0.0, 0.0
+    for a, b in zip(trail, trail[1:]):
+        L = math.dist(a, b)
+        d, f = _seg_dist(p, a, b)
+        if d <= best_d + 1e-9:
+            best_d, best_s = d, cum + f * L
+        cum += L
+    return best_d, best_s, cum
+
+
+def trail_point_at(trail, s):
+    """足跡上弧長 s 的那一點（超過就給尾巴）。"""
+    for a, b in zip(trail, trail[1:]):
+        L = math.dist(a, b)
+        if s <= L and L > 1e-9:
+            f = s / L
+            return (a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1]))
+        s -= L
+    return trail[-1]
+
+
+def trail_heading(trail, back=TRAIL_HEADING_M):
+    """目標最後往哪走（弧度）。足跡太短（目標幾乎沒動）就回 None。"""
+    if len(trail) < 2:
+        return None
+    _d, _s, total = trail_project(trail, trail[-1])
+    if total < back * 0.66:
+        return None
+    a = trail_point_at(trail, total - back)
+    b = trail[-1]
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+
+def trail_plan(p, trail, tgt, lookahead=TRAIL_LOOKAHEAD_M, on_m=TRAIL_ON_M):
+    """要不要沿足跡跟。要的話回傳 (瞄準點, 沿路距離)，不要就回 None。
+
+    不沿足跡（回 None）的情況，交回原本的直線追：
+      - 足跡不到兩點（剛看到目標）
+      - 車離足跡太遠（例如剛從別條走道找到目標，還沒接上）
+      - 車已經在足跡尾巴附近或更前面 —— 對頭相遇時目標朝車開過來就是這樣，
+        那時要的是倒車讓路，直線追那一套已經處理好了
+    沿路距離 = 車到足跡尾巴的弧長 + 尾巴到目標的直線距離。
+    """
+    if len(trail) < 2:
+        return None
+    d, s, total = trail_project(trail, p)
+    if d > on_m or total - s < 0.5:
+        return None
+    if s + lookahead < total:
+        aim = trail_point_at(trail, s + lookahead)
+    else:
+        aim = tgt                        # 快到尾巴了：直接瞄目標
+    gap = (total - s) + math.dist(trail[-1], tgt)
+    return aim, gap
+
+
+def leg_and_dir(pt, heading, pts):
+    """目標最後在環線的哪一段、往哪個方向走。回傳 (段號, 繞行方向 +1/-1)。
+
+    為什麼不用 nearest_leg：目標剛好在轉角消失時，最後的位置離兩段一樣近，
+    常常被判成它**剛離開**的那一段 —— 車就被派回已經走過的轉角
+    （Oliver 2026-11-16 回報的「直接去找上個經過的轉角」）。
+    加上方向就分得開：往東走的目標只會在東西向的那一段上。
+
+    分數 = 離那一段的距離 + 2 × (1 − |cos 夾角|)。2 m 的權重夠大：
+    轉角處兩段距離只差幾十公分，方向差 90° 就差 2 分。
+    """
+    best, best_k = float("inf"), 0
+    hx, hy = math.cos(heading), math.sin(heading)
+    for k in range(len(pts)):
+        a, b = pts[k], pts[(k + 1) % len(pts)]
+        d, _f = _seg_dist(pt, a, b)
+        L = math.dist(a, b)
+        c = abs(((b[0] - a[0]) * hx + (b[1] - a[1]) * hy) / L) if L > 1e-9 else 0.0
+        score = d + 2.0 * (1.0 - c)
+        if score < best:
+            best, best_k = score, k
+    a, b = pts[best_k], pts[(best_k + 1) % len(pts)]
+    step = 1 if (b[0] - a[0]) * hx + (b[1] - a[1]) * hy > 0 else -1
+    return best_k, step
 
 
 class HuskyApi(Node):
@@ -582,6 +774,8 @@ class HuskyApi(Node):
             # 不然兩個來源會同時寫 /husky/cmd_vel）
             "vel_mode": False,
             "loop_step": 1, "loop_flipped": False,
+            # 跟隨訊息的防抖狀態（見 hold_kind）。每趟追蹤開始時清空。
+            "msg_hold": {},
             "wall_why": None,   # 擋牆目前是誰在擋（只在改變時記 log）
             # 目標上次落在環線的第幾段。段號變了 = 它轉過路口了。
             "target_leg": None,
@@ -591,6 +785,15 @@ class HuskyApi(Node):
             #         不然每一拍都會被取消，等於永遠退不了（2026-11-14 踩到）。
             "recover_from_lost": False,
             "last_dist": None,      # 最後一次「看得到」時離目標多遠
+            # --- 沿足跡跟（2026-11-16，見 trail_plan）---
+            "trail": [],            # 目標走過的路（平滑過的 map 座標點）
+            "tgt_f": None,          # 平滑過的目標位置
+            "tgt_f_t": None,
+            "trail_mode": False,    # 現在是不是沿足跡跟（只用來在切換時記 log）
+            # 跟丟後的追法：None = 還沒決定；'go' = 沿足跡開到最後出現的位置；
+            # 'turn' = 到了，轉向目標離開的方向；'done' = 做完了（接著跑搜尋）
+            "chase": None, "chase_until": 0.0,
+            "chased": False,        # 這一輪跟丟有沒有沿足跡追過（追過就不做轉圈/倒車）
         }
         self._beh_handle = None     # 進行中的 Spin / BackUp
 
@@ -889,8 +1092,23 @@ class HuskyApi(Node):
             # 只收 map 的點。收到別的座標系就是上游接錯了，要講出來而不是默默算錯。
             self._track["message"] = f"目標的座標系是 {msg.header.frame_id}，不是 map"
             return
-        self._track["target"] = (msg.point.x, msg.point.y)
-        self._track["target_t"] = time.monotonic()
+        t = self._track
+        now = time.monotonic()
+        pt = (msg.point.x, msg.point.y)
+        t["target"] = pt
+        t["target_t"] = now
+        # 平滑之後才記進足跡：偵測位置有 ±0.1~0.2 m 的雜訊，直接記的話足跡會
+        # 歪歪扭扭，車沿著它走就會蛇行。用時間常數不用固定係數，偵測頻率變了
+        # 落後量也不會跟著變。跳太遠（重新看到、或換了一台）就直接重設。
+        f = t["tgt_f"]
+        if f is None or t["tgt_f_t"] is None or math.dist(f, pt) > 1.5:
+            f = pt
+        else:
+            a = 1.0 - math.exp(-max(now - t["tgt_f_t"], 0.0) / TRAIL_FILTER_S)
+            f = (f[0] + a * (pt[0] - f[0]), f[1] + a * (pt[1] - f[1]))
+        t["tgt_f"], t["tgt_f_t"] = f, now
+        if t["active"]:
+            trail_add(t["trail"], f)
 
     def srv_track(self, request, response):
         name = "追蹤目標"
@@ -929,6 +1147,9 @@ class HuskyApi(Node):
             recover="", recover_tried=set(), recover_t=0.0,
             recover_from_lost=False, last_dist=None,
             vel_mode=False, loop_step=1, loop_flipped=False, target_leg=None, wall_why=None,
+            msg_hold={},
+            trail=[], tgt_f=None, tgt_f_t=None, trail_mode=False,
+            chase=None, chase_until=0.0, chased=False,
             message="開始追蹤")
         # 任務的逾時給寬一點：正常結束是由 _track_tick 在 deadline 時判成功，
         # _check_task 這個保險只在追蹤邏輯本身卡住時才該觸發。
@@ -1056,6 +1277,8 @@ class HuskyApi(Node):
             if t["recover"] and t["recover_from_lost"]:
                 self._cancel_behavior()
             t["recover_tried"] = set()
+            # 又看到了：這一輪跟丟的追法和搜尋起點都作廢，下次跟丟重新決定
+            t.update(chase=None, chased=False, search_started=False)
             t["phase"] = "跟隨"
             self._track_follow(now)
         elif t["recover"]:
@@ -1063,6 +1286,16 @@ class HuskyApi(Node):
             # 所以要在這裡攔住，不然會被下面的分支切去搜尋。
             t["phase"] = "重找"
             t["message"] = f"{t['recover']}重找目標…"
+        elif self._track_chase(now):
+            # 沿足跡開到目標最後出現的位置（速度由 _follow_cmd_tick 送）
+            t["phase"] = "跟隨"
+        elif t["chased"]:
+            # 沿足跡追過了還是沒看到 → 直接上搜尋環線。
+            # ⚠️ 不做轉圈／倒車：那是給「目標在車前面很近的地方消失」用的，
+            #    這裡車已經開到目標最後出現的位置、也轉向它離開的方向看過了，
+            #    再原地轉一圈只是讓目標走得更遠（2026-11-16 Oliver 回報）。
+            t["phase"] = "搜尋"
+            self._track_search(now)
         elif age <= search_after:
             # 剛剛還看得到 —— 原地等，不要急著掉頭去搜尋。
             # 這一段存在的理由見 track_search_after_s 的參數說明。
@@ -1073,6 +1306,78 @@ class HuskyApi(Node):
         else:
             t["phase"] = "搜尋"
             self._track_search(now)
+
+    def _track_chase(self, now):
+        """跟丟後沿足跡開到目標最後出現的位置。回傳 True = 這一拍由它接管。
+
+        為什麼：在轉角跟丟時，目標其實就在轉角的另一邊。舊的做法是朝最後位置
+        直線開（會切過貨架角）、5 秒後原地轉一圈再倒車（10~15 秒，目標早走遠了）。
+        沿著目標走過的路開到轉角，轉過去通常就看到了。
+
+        只有車本來就在足跡上（從後面跟）才這樣做。對頭相遇時車在目標前面，
+        不在足跡上 —— 那種情況交回原本的「原地等 → 轉圈/倒車 → 搜尋」。
+        """
+        t = self._track
+        if t["chase"] in ("go", "turn"):
+            if now < t["chase_until"]:
+                return True
+            t["chase"] = "done"
+            self.get_logger().info("[追蹤] 沿足跡追逾時，改跑搜尋")
+            return False
+        if t["chase"] is not None or not t["vel_mode"]:
+            return False
+        with self._lock:
+            o = self._odom
+        trail = t["trail"]
+        if not o or len(trail) < 2:
+            return False
+        plan = trail_plan((o[0], o[1]), trail, trail[-1], on_m=TRAIL_CHASE_ON_M)
+        if plan is None:
+            return False
+        # 時間上限：以 0.4 m/s 開完剩下的路，再加 5 秒轉頭。擋牆把車卡住時才會用到。
+        t.update(chase="go", chased=True, chase_until=now + plan[1] / 0.4 + 5.0)
+        self.get_logger().info(
+            f"[追蹤] 跟丟了 —— 沿足跡開到最後出現的位置（{plan[1]:.1f} m）")
+        return True
+
+    def _chase_cmd(self, p, yaw):
+        """跟丟後的速度指令（10 Hz）：先沿足跡開到尾巴，再轉向目標離開的方向。"""
+        t = self._track
+        trail = t["trail"]
+        kw = dict(kp_lin=float(self.get_parameter("track_kp_lin").value),
+                  kp_yaw=float(self.get_parameter("track_kp_yaw").value),
+                  max_fwd=float(self.get_parameter("track_max_speed").value),
+                  max_back=float(self.get_parameter("track_backup_speed").value),
+                  max_yawrate=float(self.get_parameter("track_max_yawrate").value),
+                  deadband=float(self.get_parameter("track_speed_deadband_m").value),
+                  walls=self._scene.get("boxes") or [], area=self._pocket_area(),
+                  wall_margin=float(self.get_parameter("track_wall_margin_m").value),
+                  wall_h=float(self.get_parameter("track_wall_lookahead_s").value))
+        v = w = 0.0
+        if t["chase"] == "go":
+            plan = trail_plan(p, trail, trail[-1], on_m=TRAIL_CHASE_ON_M)
+            if plan is None:
+                t["chase"] = "turn"          # 到尾巴了（或被推離足跡）
+            else:
+                # standoff 0：要開到最後出現的那一點，不是停在它後面 3 m
+                v, w, _why = follow_world(p, yaw, trail[-1], 0.0, aim=plan[0],
+                                          gap=plan[1], **kw)
+                t["message"] = (f"目標暫時看不到 —— 沿它走過的路開到最後出現的位置"
+                                f"（還有 {plan[1]:.1f} m）")
+        if t["chase"] == "turn":
+            hd = trail_heading(trail)
+            if hd is None or abs(wrap_pi(hd - yaw)) < 0.25:
+                t["chase"] = "done"
+            else:
+                # 借 follow_world 轉頭：在要看的方向放一個 2 m 外的假目標、站位 2 m
+                # → 距離誤差 0、只轉頭；太靠近牆時它也會先移開再轉（不會掃到）。
+                look = (p[0] + 2.0 * math.cos(hd), p[1] + 2.0 * math.sin(hd))
+                v, w, _why = follow_world(p, yaw, look, 2.0, **kw)
+                t["message"] = "到了目標最後出現的位置 —— 轉向它離開的方向看"
+        m = Twist()
+        m.linear.x = v
+        m.angular.z = w
+        self.pub_cmd.publish(m)
 
     def _track_recover(self):
         """近距離跟丟的重找。回傳 True = 這一拍由重找接管。
@@ -1192,20 +1497,48 @@ class HuskyApi(Node):
         #    超過 search_after（預設 5 秒）就真的停 —— 那時 _track_tick 會接手
         #    去做重找或搜尋。
         age = time.monotonic() - t["target_t"]
-        if age > float(self.get_parameter("track_search_after_s").value):
-            self._stop_wheels()
-            return
         with self._lock:
             o = self._odom
         if not o:
             return
-
         hx, hy, yaw = o[0], o[1], o[2]
+
+        # 跟丟後沿足跡追（_track_chase 決定要不要、這裡送速度）
+        if t["chase"] in ("go", "turn"):
+            self._chase_cmd((hx, hy), yaw)
+            return
+        # 沿足跡追完了還沒看到：停著等 _track_tick 切去搜尋。
+        # ⚠️ 不能落到下面的直線追 —— 車已經在最後出現的位置上，
+        #    朝它「保持 3 m」等於倒車退回去。
+        if t["chased"] or age > float(self.get_parameter("track_search_after_s").value):
+            self._stop_wheels()
+            return
+
         tx, ty = t["target"]
         dist = math.hypot(tx - hx, ty - hy)
+        dead = float(self.get_parameter("track_speed_deadband_m").value)
+
+        # 看得到目標、而且車在它的足跡上 → 沿足跡跟（瞄足跡上前方 1.5 m 的點，
+        # 距離用沿路量的）。其他情況（剛找到、對頭相遇、太近要倒車）照舊直線追。
+        # ⚠️ 太近（沿路距離 < 站位 − 不動區）時一定交回直線追：倒車要車頭對著
+        #    目標往後退，沿足跡的瞄準點在前面，混著用車頭會亂轉。
+        plan = None
+        if age <= float(self.get_parameter("track_fresh_s").value) and t["tgt_f"]:
+            plan = trail_plan((hx, hy), t["trail"], t["tgt_f"])
+            if plan is not None and plan[1] < t["standoff"] - dead:
+                plan = None
+        if (plan is not None) != t["trail_mode"]:
+            t["trail_mode"] = plan is not None
+            self.get_logger().info(
+                "[追蹤] 沿目標的足跡跟" if plan else "[追蹤] 改回直線追")
+        if plan is not None:
+            aim, gap = plan
+            tx, ty = t["tgt_f"]
+            dist = gap
+        else:
+            aim = gap = None
         e_d = dist - t["standoff"]
 
-        dead = float(self.get_parameter("track_speed_deadband_m").value)
         v, w, why = follow_world(
             (hx, hy), yaw, (tx, ty), t["standoff"],
             float(self.get_parameter("track_kp_lin").value),
@@ -1215,26 +1548,38 @@ class HuskyApi(Node):
             float(self.get_parameter("track_max_yawrate").value),
             dead, walls=self._scene.get("boxes") or [], area=self._pocket_area(),
             wall_margin=float(self.get_parameter("track_wall_margin_m").value),
-            wall_h=float(self.get_parameter("track_wall_lookahead_s").value))
+            wall_h=float(self.get_parameter("track_wall_lookahead_s").value),
+            aim=aim, gap=gap)
 
-        if why == "close":
-            t["message"] = (f"太靠近貨架或牆 —— 先直直移開，不轉頭"
-                            f"（離目標 {dist:.1f} m）")
+        # 先決定「哪一種」訊息，再經過 hold_kind 防抖，最後才填數字。
         # ⚠️ 用 < 0.01 不用 == 0：被夾到只剩 -0.003 這種值時，訊息會變成
         #    「沿著貨架或牆走（速度 -0.00 m/s）」，看的人會以為它在動。
+        if why == "close":
+            kind = "close"
         elif why == "area" and abs(v) < 0.01:
-            t["message"] = f"退到路口外側了 —— 停著讓目標轉彎（離目標 {dist:.1f} m）"
+            kind = "area"
         elif why == "wall" and abs(v) < 0.01:
-            t["message"] = f"前面是貨架或牆 —— 先轉頭（離目標 {dist:.1f} m）"
+            kind = "wall_stop"
         elif why == "wall":
-            t["message"] = (f"沿著貨架或牆走（離目標 {dist:.1f} m，"
-                            f"速度 {v:.2f} m/s）")
+            kind = "wall"
         elif abs(e_d) < dead:
-            t["message"] = f"已就位（離目標 {dist:.1f} m）"
+            kind = "settled"
         elif v < 0:
-            t["message"] = f"目標靠到 {dist:.1f} m —— 倒車保持距離"
+            kind = "backing"
         else:
-            t["message"] = f"跟隨中：離目標 {dist:.1f} m（速度 {v:.2f} m/s）"
+            kind = "following"
+        kind = hold_kind(t["msg_hold"], kind, time.monotonic(), TRACK_MSG_HOLD_S,
+                         immediate=kind in ("close", "area", "wall_stop", "wall"))
+        # 速度只給到 0.1：給到 0.01 時數字每一拍都在變，看起來也像在跳。
+        t["message"] = {
+            "close": f"太靠近貨架或牆 —— 先直直移開，不轉頭（離目標 {dist:.1f} m）",
+            "area": f"退到路口外側了 —— 停著讓目標轉彎（離目標 {dist:.1f} m）",
+            "wall_stop": f"前面是貨架或牆 —— 先轉頭（離目標 {dist:.1f} m）",
+            "wall": f"沿著貨架或牆走（離目標 {dist:.1f} m，速度 {v:.1f} m/s）",
+            "settled": f"已就位（離目標 {dist:.1f} m）",
+            "backing": f"目標靠到 {dist:.1f} m —— 倒車保持距離",
+            "following": f"跟隨中：離目標 {dist:.1f} m（速度 {abs(v):.1f} m/s）",
+        }[kind]
 
         if why != t.get("wall_why"):
             if why:
@@ -1283,15 +1628,29 @@ class HuskyApi(Node):
         # 第一次上環線時，從「離最後看到目標的位置最近的那一段」接進去，
         # 不要總是從第 1 點開始（2026-11-15）。
         #
-        # 為什麼：環線的方向和目標繞行的方向是同一個（見積木的預設值），
-        # 所以從目標最後出現的地方接上去，等車開到那裡時目標已經往前走了
-        # —— 車自然接在它**後面**。從第 1 點開始的話，可能要繞大半圈才追到，
-        # 更糟的是有機會在對向的那一段和它迎面錯身而過。
+        # 為什麼：這一段通常是在**翻成同向之後**才會走到（看過目標、又跟丟）。
+        # 積木預設的環線和目標是反向的，但對頭相遇、目標轉過路口時
+        # _check_corner 已經把 loop_step 翻成同向，所以從目標最後出現的地方
+        # 接上去，等車開到那裡時目標已經往前走了 —— 車自然接在它**後面**。
+        # 從第 1 點開始的話，可能要繞大半圈才追到。
+        # （2026-11-16 修註解：原本寫「環線和目標同向（見積木預設值）」，
+        #   那是 11/15 早上預設同向時的說法，積木後來改回反向了。）
         #
         # 沒看過目標（一開始就看不到）就還是從第 1 點開始。
         if not t["search_started"]:
             t["search_started"] = True
-            if t["target"] is not None:
+            hd = trail_heading(t["trail"])
+            if hd is not None:
+                # 知道目標往哪走（2026-11-16）：挑它所在的那一段、而且**順著它的方向**
+                # 繞 —— 車剛從後面跟丟它，同向追才會接在它後面。這一步同時取代了
+                # _check_corner 的「翻一次」：方向是量出來的，之後不再翻。
+                leg, step = leg_and_dir(t["trail"][-1], hd, t["search"])
+                t.update(loop_step=step, loop_flipped=True)
+                t["search_i"] = next_wp(leg, step, len(t["search"]))
+                t["message"] = (f"順著目標的方向接上環線（第 {leg + 1} 段，"
+                                f"先去第 {t['search_i'] + 1} 點）")
+                self.get_logger().info(f"[追蹤] {t['message']}")
+            elif t["target"] is not None:
                 t["search_i"] = next_wp(nearest_leg(t["target"], t["search"]),
                                         t["loop_step"], len(t["search"]))
                 t["message"] = f"從離目標最近的那一段接上環線（第 {t['search_i'] + 1} 點）"

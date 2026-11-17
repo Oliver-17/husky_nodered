@@ -428,9 +428,265 @@ if d24 > GW["standoff"] + 1.0:
 run_nr = simulate(-1.22, -7.05, h0, tgt2, 25.0, ctrl_with(0.0))
 c24_nr = min(body_clear(x, y, yw, RAW1) for x, y, yw, _ in run_nr)
 
+# =============================================================================
+#  跟隨中／已就位來回跳（2026-11-16，Oliver 回報）
+#
+#  不只是文字在跳，車也在頓：舊的不動區邊緣從 0 跳到 kp×0.3 = 0.6 m/s，
+#  目標 0.5 m/s 時平衡點（落後 0.25 m）落在不動區裡 →「停、衝、停」。
+#  ㉕ 驗速度在不動區邊緣連續；㉖ 用一維小模擬跟 0.5 m/s 的目標，
+#  有對照組（舊的跳躍式）證明這支抓得到；㉗ 驗訊息防抖。
+# =============================================================================
+from husky_api_node import dist_speed, hold_kind                 # noqa: E402
+
+# ㉕ 不動區邊緣連續：剛出不動區時速度要接近 0，不是 0.6
+for e in (0.3001, -0.3001):
+    s25 = dist_speed(e, 2.0, 0.3)
+    if abs(s25) > 0.01:
+        fails.append(f"㉕ 誤差 {e} m 剛出不動區，速度應該接近 0，實際 {s25:.3f}")
+if dist_speed(0.29, 2.0, 0.3) != 0.0:
+    fails.append("㉕ 不動區裡速度應該是 0")
+if dist_speed(1.3, 2.0, 0.3) <= 0 or dist_speed(-1.3, 2.0, 0.3) >= 0:
+    fails.append("㉕ 正負號錯了：太遠要往前（正）、太近要倒車（負）")
+
+
+def follow_1d(spd, law, secs=40.0, dt=0.05):
+    """一維：目標以 spd 往前走，車在後面跟，10 Hz 下指令、含加減速上限。
+    回傳 10 秒之後每一拍的 (指令, 實際距離)。"""
+    x = v = vc = 0.0
+    tx = 4.0
+    out = []
+    for i in range(int(secs / dt)):
+        tx += spd * dt
+        if i % 2 == 0:
+            vc = law(tx - x)
+        lim = (1.0 if abs(vc) > abs(v) else 1.5) * dt
+        v += max(-lim, min(lim, vc - v))
+        x += v * dt
+        if i * dt > 10.0 and i % 2 == 0:
+            out.append((vc, tx - x))
+    return out
+
+
+def law_new(d):
+    v, _, _ = follow_world((0.0, 0.0), 0.0, (d, 0.0), walls=[], area=None, **GW)
+    return v
+
+
+def law_old(d):                       # 舊版：不動區外直接 kp × 誤差
+    e = d - GW["standoff"]
+    return 0.0 if abs(e) < GW["deadband"] else max(-0.7, min(1.0, GW["kp_lin"] * e))
+
+
+def stop_go(run):
+    return sum(1 for a, b in zip(run, run[1:]) if (a[0] == 0.0) != (b[0] == 0.0))
+
+
+# ㉖ 跟 0.5 m/s（倉庫目標車的速度）和 0.4 m/s（move_target 預設）
+for spd in (0.5, 0.4):
+    r_new, r_old = follow_1d(spd, law_new), follow_1d(spd, law_old)
+    n_new, n_old = stop_go(r_new), stop_go(r_old)
+    jump = max(abs(a[0] - b[0]) for a, b in zip(r_new, r_new[1:]))
+    if n_new > 0:
+        fails.append(f"㉖ 目標 {spd} m/s：30 秒內停／走切換 {n_new} 次，應該 0 次")
+    if jump > 0.05:
+        fails.append(f"㉖ 目標 {spd} m/s：速度指令一拍跳 {jump:.2f} m/s，應該是平順的")
+    if n_old < 10:
+        fails.append(f"㉖ 對照組（舊的跳躍式）只切換 {n_old} 次 —— 這支測試抓不到原本的毛病了")
+    gap = sum(a[1] for a in r_new) / len(r_new)
+    if not 3.3 < gap < 3.8:
+        fails.append(f"㉖ 目標 {spd} m/s：平均距離 {gap:.2f} m，應該在 3.3~3.8")
+    if spd == 0.5:
+        n26, o26, g26 = n_new, n_old, gap
+
+# ㉗ 訊息防抖（假時鐘）
+st = {}
+seq = []
+for i in range(30):                   # 每 0.3 秒來回切一次 → 一直維持「跟隨」
+    seq.append(hold_kind(st, "following" if (i // 3) % 2 == 0 else "settled",
+                         i * 0.1, 1.0))
+if set(seq) != {"following"}:
+    fails.append(f"㉗ 每 0.3 秒來回切時應該一直顯示跟隨，實際出現 {sorted(set(seq))}")
+st = {}
+hold_kind(st, "following", 0.0, 1.0)
+got = [hold_kind(st, "settled", 0.1 * i, 1.0) for i in range(1, 13)]
+if got[8] != "following" or got[-1] != "settled":
+    fails.append(f"㉗ 持續 1 秒才該換成已就位：0.9 秒時 {got[8]}、1.2 秒時 {got[-1]}")
+if hold_kind(st, "close", 1.3, 1.0, immediate=True) != "close":
+    fails.append("㉗ 擋牆／太靠近要馬上顯示，不能被防抖延後")
+
+# =============================================================================
+#  沿目標的足跡跟（2026-11-16，Oliver 回報「到轉角一定轉到快撞牆、一直調整、
+#  目標不見；不見後也沒去它最後出現的位置，而是去上個經過的轉角」）
+#  ㉘~㉚ 驗純函式；㉛ 用轉角小模擬（含相機視角與貨架擋視線）比新舊。
+# =============================================================================
+from husky_api_node import (trail_add, trail_plan, trail_heading,       # noqa: E402
+                            leg_and_dir, nearest_leg, next_wp, wrap_pi)
+
+# ㉘ 足跡：每 0.3 m 一點、總長有上限、跳太遠就重新開始
+tr = []
+for i in range(200):
+    trail_add(tr, (0.0, i * 0.05))                 # 走 10 m，每步 5 cm
+gaps = [math.dist(a, b) for a, b in zip(tr, tr[1:])]
+if min(gaps) < 0.3 - 1e-9:
+    fails.append(f"㉘ 足跡點的間距應該 ≥ 0.3 m，實際最小 {min(gaps):.3f}")
+for i in range(200, 800):
+    trail_add(tr, (0.0, i * 0.05))                 # 再走 30 m → 應該被砍到 25 m 以內
+if sum(math.dist(a, b) for a, b in zip(tr, tr[1:])) > 25.0 + 1e-6:
+    fails.append("㉘ 足跡總長應該被限制在 25 m 以內")
+if not trail_add(tr, (10.0, 10.0)) or len(tr) != 1:
+    fails.append("㉘ 新的點離尾巴太遠（> 2.5 m）時足跡要重新開始")
+
+# ㉙ trail_plan：在足跡上 → 瞄前方、距離沿路量；不在足跡上 / 在尾巴前面 → None
+L = [(0.0, y * 0.3) for y in range(31)] + [(x * 0.3, 9.0) for x in range(1, 11)]
+tg = (3.0 + 0.3, 9.0)
+pl = trail_plan((0.0, 6.0), L, tg)
+if pl is None:
+    fails.append("㉙ 車在足跡上（目標後面），應該沿足跡跟")
+else:
+    aim, gap = pl
+    if abs(aim[0]) > 1e-6 or abs(aim[1] - 7.5) > 1e-6:
+        fails.append(f"㉙ 瞄準點應該在足跡上前方 1.5 m 的 (0, 7.5)，實際 {aim}")
+    if abs(gap - (3.0 + 3.0 + 0.3)) > 1e-6:
+        fails.append(f"㉙ 沿路距離應該是 3 + 3 + 0.3 = 6.3（不是直線 4.4），實際 {gap:.2f}")
+if trail_plan((-1.5, 6.0), L, tg) is not None:
+    fails.append("㉙ 車離足跡 1.5 m，不該沿足跡跟（交回直線追）")
+if trail_plan((4.5, 9.0), L, tg) is not None:
+    fails.append("㉙ 車在足跡尾巴前面（對頭相遇），不該沿足跡跟")
+hd = trail_heading(L)
+if hd is None or abs(hd) > 1e-6:
+    fails.append(f"㉙ 足跡最後往東走，方向應該是 0，實際 {hd}")
+
+# ㉚ 跟丟後的搜尋起點：目標往北走、在 (0,9) 轉往東、最後出現在 (0.6, 9)
+#    （搜尋環線用積木預設的順序，也就是和目標反向的那一串）
+SEARCH = [(5.6, -9.0), (5.6, 9.0), (0.0, 9.0), (0.0, -9.0)]
+leg, step = leg_and_dir((0.6, 9.0), 0.0, SEARCH)
+nxt = SEARCH[next_wp(leg, step, 4)]
+if nxt != (5.6, 9.0):
+    fails.append(f"㉚ 目標往東走，應該先去它前面的轉角 (5.6, 9)，實際去 {nxt}")
+old_nxt = SEARCH[next_wp(nearest_leg((0.6, 9.0), SEARCH), 1, 4)]   # 舊：沒翻方向時
+if old_nxt != (0.0, 9.0):
+    fails.append(f"㉚ 對照組：舊做法應該會去剛經過的轉角 (0, 9)，實際 {old_nxt}")
+# 剛好在轉角上、量到的點偏向南邊那一段時，方向還是要分得出來
+leg, step = leg_and_dir((0.15, 8.75), 0.0, SEARCH)
+if SEARCH[next_wp(leg, step, 4)] != (5.6, 9.0):
+    fails.append("㉚ 目標在轉角上、量到的點偏南：還是應該往東邊的轉角去")
+
+
+# ㉛ 轉角小模擬：目標從 (0,2) 往北走、在 (0,9) 轉東、在 (5.6,9) 轉南，車在後面 3.5 m
+#    相機模型：前視 ±35°（horizontal_fov 1.204）、1.5~8 m、貨架會擋視線；
+#    量到的是目標表面（偏向車 0.28 m）＋ 0.1 m 雜訊。
+def _seg_hits(p, q, b):
+    t0, t1 = 0.0, 1.0
+    for i in (0, 1):
+        d = q[i] - p[i]
+        if abs(d) < 1e-12:
+            if p[i] < b[i] or p[i] > b[i + 2]:
+                return False
+        else:
+            a1, a2 = (b[i] - p[i]) / d, (b[i + 2] - p[i]) / d
+            t0, t1 = max(t0, min(a1, a2)), min(t1, max(a1, a2))
+            if t0 > t1:
+                return False
+    return True
+
+
+def _visible(p, yaw, tg):
+    d = math.dist(p, tg)
+    if not 1.5 <= d <= 8.0:
+        return False
+    if abs(wrap_pi(math.atan2(tg[1] - p[1], tg[0] - p[0]) - yaw)) > 0.6:
+        return False
+    return not any(_seg_hits(p, tg, b) for b in RAW[:3])
+
+
+def corner_run(new, seed, secs=45.0, dt=0.05):
+    """回傳 (擋牆介入秒數, 看不到的秒數, 車身離貨架最近, 最後離目標多遠)。
+    new=True 照節點的新流程：看得到 → 沿足跡跟；看不到 → 沿足跡開到尾巴、轉向；
+    new=False 是舊的：朝最後看到的位置直線追 5 秒。"""
+    import random
+    rnd = random.Random(seed)
+    x, y, yaw, v, w = 0.0, -1.5, math.pi / 2, 0.0, 0.0
+    last, last_t, filt, trail, chase = None, -1e9, None, [], None
+    wall = blind = 0.0
+    clear = 9.0
+    vc = wc = 0.0
+    for i in range(int(secs / dt)):
+        t = i * dt
+        tg = target_on_loop(11.0, t)
+        if i % 2 == 0:
+            if _visible((x, y), yaw, tg):
+                ux, uy = x - tg[0], y - tg[1]
+                n = math.hypot(ux, uy)
+                last = (tg[0] + 0.28 * ux / n + rnd.gauss(0, 0.1),
+                        tg[1] + 0.28 * uy / n + rnd.gauss(0, 0.1))
+                last_t = t
+                a = 1 - math.exp(-0.1 / 0.3)
+                filt = last if filt is None or math.dist(filt, last) > 1.5 else \
+                    (filt[0] + a * (last[0] - filt[0]), filt[1] + a * (last[1] - filt[1]))
+                trail_add(trail, filt)
+                chase = None
+            else:
+                blind += 0.1
+            age, why = t - last_t, None
+            vc = wc = 0.0
+            if last is not None and not new and age <= 5.0:
+                vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **GW)
+            elif last is not None and new and age <= 1.5:
+                pl = trail_plan((x, y), trail, filt)
+                if pl and pl[1] >= GW["standoff"] - GW["deadband"]:
+                    vc, wc, why = follow_world((x, y), yaw, filt, walls=RAW,
+                                               aim=pl[0], gap=pl[1], **GW)
+                else:
+                    vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **GW)
+            elif last is not None and new:
+                if chase is None:
+                    chase = "go" if trail_plan((x, y), trail, trail[-1], on_m=2.0) else "done"
+                if chase == "go":
+                    pl = trail_plan((x, y), trail, trail[-1], on_m=2.0)
+                    if pl is None:
+                        chase = "turn"
+                    else:
+                        vc, wc, why = follow_world((x, y), yaw, trail[-1],
+                                                   walls=RAW, aim=pl[0], gap=pl[1],
+                                                   **dict(GW, standoff=0.0))
+                if chase == "turn":
+                    h = trail_heading(trail)
+                    look = (x + 2 * math.cos(h), y + 2 * math.sin(h))
+                    vc, wc, why = follow_world((x, y), yaw, look, walls=RAW,
+                                               **dict(GW, standoff=2.0))
+                    if abs(wrap_pi(h - yaw)) < 0.25:
+                        chase = "done"
+            if why:
+                wall += 0.1
+        lim = (1.0 if abs(vc) > abs(v) else 1.5) * dt
+        v += max(-lim, min(lim, vc - v))
+        w += max(-3.2 * dt, min(3.2 * dt, wc - w))
+        x += v * math.cos(yaw) * dt
+        y += v * math.sin(yaw) * dt
+        yaw += w * dt
+        clear = min(clear, body_clear(x, y, yaw, RAW))
+    return wall, blind, clear, math.dist((x, y), target_on_loop(11.0, secs))
+
+
+r31n = [corner_run(True, sd) for sd in (1, 2, 3)]
+r31o = [corner_run(False, sd) for sd in (1, 2, 3)]
+for sd, (wl, bl, cl, de) in zip((1, 2, 3), r31n):
+    if wl > 0.5:
+        fails.append(f"㉛ 新（種子 {sd}）：擋牆介入 {wl:.1f} 秒，沿足跡跟應該幾乎不碰牆")
+    if cl < 1.0:
+        fails.append(f"㉛ 新（種子 {sd}）：車身離貨架最近 {cl:.2f} m，應該 ≥ 1.0")
+    if de > 5.0:
+        fails.append(f"㉛ 新（種子 {sd}）：繞過兩個轉角後離目標 {de:.1f} m，跟丟了")
+if not any(de > 6.0 or cl < 0.6 for _wl, _bl, cl, de in r31o):
+    fails.append("㉛ 對照組（舊的直線追）沒有出現貼牆或跟丟 —— 這支測試抓不到原本的毛病了")
+
 print(f"   ⑳ 繞貨架角：新 最近 {c_new:.2f} m／舊 {c_old:.2f} m（負的＝撞進去）")
 print(f"   ㉔ 貨架角旁脫出：最近 {c24:.2f} m（拿掉「不准轉頭」時 {c24_nr:.2f} m），"
       f"25 秒時離目標 {d24:.2f} m")
+print(f"   ㉖ 跟 0.5 m/s 目標：停／走切換 新 {n26} 次／舊 {o26} 次，平均距離 {g26:.2f} m")
+print("   ㉛ 轉角（3 個種子）擋牆秒數／看不到秒數／離貨架最近／最後距離：")
+print("      新 " + "  ".join(f"{a:.1f}/{b:.1f}/{c:.2f}/{d:.1f}" for a, b, c, d in r31n))
+print("      舊 " + "  ".join(f"{a:.1f}/{b:.1f}/{c:.2f}/{d:.1f}" for a, b, c, d in r31o))
 print(f"   ㉑ 對頭讓路：最北退到 y={y_max:.2f}，和目標最近 {sep_min:.2f} m"
       f"（不准退出環線時 {sep0:.2f} m），車身離牆最近 {clr:.2f} m，"
       f"40 秒時離目標 {d_end:.2f} m")
