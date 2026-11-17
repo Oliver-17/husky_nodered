@@ -599,7 +599,7 @@ def _visible(p, yaw, tg):
     return not any(_seg_hits(p, tg, b) for b in RAW[:3])
 
 
-def corner_run(new, seed, secs=45.0, dt=0.05):
+def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules"):
     """回傳 (擋牆介入秒數, 看不到的秒數, 車身離貨架最近, 最後離目標多遠)。
     new=True 照節點的新流程：看得到 → 沿足跡跟；看不到 → 沿足跡開到尾巴、轉向；
     new=False 是舊的：朝最後看到的位置直線追 5 秒。"""
@@ -630,14 +630,14 @@ def corner_run(new, seed, secs=45.0, dt=0.05):
             age, why = t - last_t, None
             vc = wc = 0.0
             if last is not None and not new and age <= 5.0:
-                vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **GW)
+                vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **dict(GW, safety=safety))
             elif last is not None and new and age <= 1.5:
                 pl = trail_plan((x, y), trail, filt)
                 if pl and pl[1] >= GW["standoff"] - GW["deadband"]:
                     vc, wc, why = follow_world((x, y), yaw, filt, walls=RAW,
-                                               aim=pl[0], gap=pl[1], **GW)
+                                               aim=pl[0], gap=pl[1], **dict(GW, safety=safety))
                 else:
-                    vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **GW)
+                    vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **dict(GW, safety=safety))
             elif last is not None and new:
                 if chase is None:
                     chase = "go" if trail_plan((x, y), trail, trail[-1], on_m=2.0) else "done"
@@ -648,12 +648,12 @@ def corner_run(new, seed, secs=45.0, dt=0.05):
                     else:
                         vc, wc, why = follow_world((x, y), yaw, trail[-1],
                                                    walls=RAW, aim=pl[0], gap=pl[1],
-                                                   **dict(GW, standoff=0.0))
+                                                   **dict(GW, standoff=0.0, safety=safety))
                 if chase == "turn":
                     h = trail_heading(trail)
                     look = (x + 2 * math.cos(h), y + 2 * math.sin(h))
                     vc, wc, why = follow_world((x, y), yaw, look, walls=RAW,
-                                               **dict(GW, standoff=2.0))
+                                               **dict(GW, standoff=2.0, safety=safety))
                     if abs(wrap_pi(h - yaw)) < 0.25:
                         chase = "done"
             if why:
@@ -670,6 +670,7 @@ def corner_run(new, seed, secs=45.0, dt=0.05):
 
 r31n = [corner_run(True, sd) for sd in (1, 2, 3)]
 r31o = [corner_run(False, sd) for sd in (1, 2, 3)]
+r31c = [corner_run(True, sd, safety="cbf") for sd in (1, 2, 3)]
 for sd, (wl, bl, cl, de) in zip((1, 2, 3), r31n):
     if wl > 0.5:
         fails.append(f"㉛ 新（種子 {sd}）：擋牆介入 {wl:.1f} 秒，沿足跡跟應該幾乎不碰牆")
@@ -680,6 +681,221 @@ for sd, (wl, bl, cl, de) in zip((1, 2, 3), r31n):
 if not any(de > 6.0 or cl < 0.6 for _wl, _bl, cl, de in r31o):
     fails.append("㉛ 對照組（舊的直線追）沒有出現貼牆或跟丟 —— 這支測試抓不到原本的毛病了")
 
+# =============================================================================
+#  CBF 安全濾波（2026-11-17）
+#
+#  ㉜~㊱ 驗函式本身（C1）；㊲ 拿同一批情境和手寫規則並排比（C2）。
+#  CBF 是用來**取代**三層手寫規則的，所以每一個當初逼出規則的情境
+#  （⑳ 切貨架角、㉑ 對頭讓路、㉓㉔ 貨架角旁轉頭、㉛ 轉角）它都要過。
+# =============================================================================
+from husky_api_node import (cbf_filter, cbf_constraints, cbf_solve,          # noqa: E402
+                            CBF_W_YAW, CBF_CIRCLE_OFF_M, CBF_CIRCLE_R_M)
+import random                                                               # noqa: E402
+
+GC = dict(GW, safety="cbf")
+
+# ㉜ 什麼都沒擋到時，和原本的控制律完全一樣（同⑰的情境）
+for (px, py, yaw, tx, ty) in [(0, 0, 0.0, 8, 0), (0, 0, 0.0, 1, 0), (0, 0, 0.0, 3, 0),
+                              (0, 0, 0.3, 5, 2), (0, 0, -1.0, 4, -3), (0, 0, 2.8, 6, 0.5)]:
+    d = math.hypot(tx - px, ty - py)
+    e = wrap_pi(math.atan2(ty - py, tx - px) - yaw)
+    v0, w0 = follow_cmd(d, e, **GW)
+    v1, w1, why = follow_world((px, py), yaw, (tx, ty), walls=[], area=None, **GC)
+    if abs(v0 - v1) > 1e-9 or abs(w0 - w1) > 1e-9 or why is not None:
+        fails.append(f"㉜ CBF 沒有牆時應該和 follow_cmd 一樣：({px},{py})→({tx},{ty}) "
+                     f"({v0:.3f},{w0:.3f}) vs ({v1:.3f},{w1:.3f}) why={why}")
+
+# ㉝ 求解器的答案真的是「可行裡最近的」：和把 (v, ω) 平面切 241x241 格的暴力搜尋比
+#    暴力搜尋只會比真正的最佳解差（格點不一定落在最佳點上），
+#    所以要求：解可行，而且代價 ≤ 暴力搜尋找到的最佳代價（多 1e-3 容許）。
+rnd = random.Random(7)
+n33 = bad33 = 0
+while n33 < 60:
+    p = (rnd.uniform(-1.5, 7.0), rnd.uniform(-10.5, 10.5))
+    yaw = rnd.uniform(-math.pi, math.pi)
+    cons = cbf_constraints(p, yaw, RAW, area_of(TRACK_POCKET_M))
+    if not cons:
+        continue
+    v0, w0 = rnd.uniform(-0.7, 1.0), rnd.uniform(-1.0, 1.0)
+    v, w, okk = cbf_solve(v0, w0, cons, 1.0, 0.7, 1.0)
+    if not okk:
+        continue
+    n33 += 1
+    cost = (v - v0) ** 2 + CBF_W_YAW * (w - w0) ** 2
+    feas = all(av * v + aw * w >= b - 1e-6 for av, aw, b, _ in cons)
+    grid_best = math.inf
+    for i in range(241):
+        gv = -0.7 + 1.7 * i / 240
+        for j in range(241):
+            gw = -1.0 + 2.0 * j / 240
+            if all(av * gv + aw * gw >= b for av, aw, b, _ in cons):
+                grid_best = min(grid_best, (gv - v0) ** 2 + CBF_W_YAW * (gw - w0) ** 2)
+    if not feas or cost > grid_best + 1e-3:
+        bad33 += 1
+        fails.append(f"㉝ 求解器不是最佳：p={p} 代價 {cost:.4f}，格點最佳 {grid_best:.4f}，"
+                     f"可行={feas}")
+
+# ㉞ 只有一條限制起作用時 ＝ null space 投影：修正量和那條限制的法向量平行
+#    （在 z=(v, √w_yaw·ω) 座標裡），和它垂直的分量完全不動。
+p, yaw = (1.2, 0.0), 0.5                  # 車頭斜斜對著貨架西面（x=2.0）
+cons = cbf_constraints(p, yaw, RAW)
+v0, w0 = 0.8, 0.1
+v, w, _ = cbf_solve(v0, w0, cons, 1.0, 0.7, 1.0)
+k = math.sqrt(CBF_W_YAW)
+act = [(av, aw / k) for av, aw, b, _ in cons if abs(av * v + aw * w - b) < 1e-6]
+dz = (v - v0, k * (w - w0))
+if len(act) != 1:
+    fails.append(f"㉞ 這個情境應該剛好一條限制起作用，實際 {len(act)} 條")
+else:
+    a = act[0]
+    cross = a[0] * dz[1] - a[1] * dz[0]
+    if abs(cross) > 1e-9 or math.hypot(*dz) < 1e-3:
+        fails.append(f"㉞ 修正量應該和限制的法向量平行（只改違規的分量），"
+                     f"外積 {cross:.2e}，修正量 {dz}")
+
+# ㉟ 隨機放車、隨機目標，跑 150 次 × 8 秒：車身從來不碰貨架或牆
+#    （模擬含加減速上限，和 P 控制器、取樣頻率都不理想 —— 量的是「實際上」夠不夠安全）
+def cbf_ctrl(area=None, alpha=None):
+    def f(p, yaw, tg):
+        v, w, _ = follow_world(p, yaw, tg, walls=RAW, area=area, cbf_alpha=alpha, **GC)
+        return v, w
+    return f
+
+
+rnd = random.Random(11)
+c35 = 9.0
+for _ in range(150):
+    while True:
+        x0, y0 = rnd.uniform(-1.5, 7.0), rnd.uniform(-11.0, 11.0)
+        yaw0 = rnd.uniform(-math.pi, math.pi)
+        if body_clear(x0, y0, yaw0, RAW) > 0.3:
+            break
+    tg = (rnd.uniform(-1.5, 7.0), rnd.uniform(-11.0, 11.0))
+    run = simulate(x0, y0, yaw0, lambda t, tg=tg: tg, 8.0, cbf_ctrl())
+    c35 = min(c35, min(body_clear(x, y, yw, RAW) for x, y, yw, _ in run))
+if c35 <= 0.0:
+    fails.append(f"㉟ 隨機情境裡車身碰到貨架或牆了（最近 {c35:.3f} m）")
+
+# ㊱ 貨架角旁原地轉頭（㉓ 的情境：中心離貨架角 0.52 m）。CBF 沒有「不准轉頭」那條規則，
+#    靠後圓的限制自己擋住 —— 車尾不能掃到貨架。對照組：拿掉 CBF 照轉，會掃到。
+p36, yaw36 = (-1.49, -7.06), math.radians(49)
+c36, c36_raw = 9.0, 9.0
+for tg in [(0.0, -3.7), (3.0, -7.0), (-1.0, -10.0)]:
+    run = simulate(p36[0], p36[1], yaw36, lambda t, tg=tg: tg, 4.0,
+                   lambda p, yaw, g: follow_world(p, yaw, g, walls=RAW1, **GC)[:2])
+    c36 = min(c36, min(body_clear(x, y, yw, RAW1) for x, y, yw, _ in run))
+    run = simulate(p36[0], p36[1], yaw36, lambda t, tg=tg: tg, 4.0, old_ctrl)
+    c36_raw = min(c36_raw, min(body_clear(x, y, yw, RAW1) for x, y, yw, _ in run))
+if c36 <= 0.0:
+    fails.append(f"㊱ CBF 在貨架角旁轉頭掃到了（最近 {c36:.3f} m）")
+if c36_raw > 0.0:
+    fails.append(f"㊱ 對照組（不擋）應該掃到貨架，結果最近 {c36_raw:.2f} m —— 情境無效")
+
+# ㊲ C2：當初逼出手寫規則的每一個情境，換成 CBF 一樣要過（門檻和 rules 版相同）
+def cbf_area_ctrl(walls, area):
+    def f(p, yaw, tg):
+        return follow_world(p, yaw, tg, walls=walls, area=area, **GC)[:2]
+    return f
+
+
+A37 = area_of(TRACK_POCKET_M)
+run = simulate(0.0, 8.5, 0.0, fixed, 20.0, cbf_area_ctrl(RAW, A37))           # ⑳
+c37_20 = min(body_clear(x, y, yw, RAW) for x, y, yw, _ in run)
+d37_20 = math.dist(run[-1][:2], run[-1][3])
+if c37_20 <= 0.05 or d37_20 > GW["standoff"] + 0.6:
+    fails.append(f"㊲⑳ CBF 繞貨架角：最近 {c37_20:.2f} m，最後離目標 {d37_20:.2f} m")
+run = simulate(0.0, 6.0, -math.pi / 2, tgt, 40.0, cbf_area_ctrl(RAW, A37))     # ㉑
+s37 = min(math.dist((x, y), g) for x, y, _, g in run)
+y37 = max(y for _, y, _, _ in run)
+c37_21 = min(body_clear(x, y, yw, RAW) for x, y, yw, _ in run)
+d37_21 = math.dist(run[-1][:2], run[-1][3])
+if s37 < 0.8 or y37 < 9.8 or c37_21 <= 0.05 or d37_21 > GW["standoff"] + 1.0:
+    fails.append(f"㊲㉑ CBF 對頭讓路：和目標最近 {s37:.2f}、最北 {y37:.2f}、"
+                 f"離牆 {c37_21:.2f}、40 秒時離目標 {d37_21:.2f}")
+run = simulate(-1.22, -7.05, h0, tgt2, 25.0, cbf_area_ctrl(RAW1, A37))       # ㉔
+c37_24 = min(body_clear(x, y, yw, RAW1) for x, y, yw, _ in run)
+d37_24 = math.dist(run[-1][:2], run[-1][3])
+if c37_24 <= 0.05 or d37_24 > GW["standoff"] + 1.0:
+    fails.append(f"㊲㉔ CBF 貨架角旁脫出：最近 {c37_24:.2f} m，25 秒時離目標 {d37_24:.2f} m")
+for sd, (wl, bl, cl, de) in zip((1, 2, 3), r31c):                            # ㉛
+    if cl < 1.0 or de > 5.0:
+        fails.append(f"㊲㉛ CBF 轉角（種子 {sd}）：離貨架最近 {cl:.2f} m，最後離目標 {de:.1f} m")
+
+# ㊳ 2026-11-17 SITL 抓到的：讓路後車在貨架角旁（中心離角 0.78 m，比邊界 0.8 近 2 cm），
+#    目標從車旁 1.1 m 經過往北走。「離貨架遠一點」和「不准再靠近目標」衝突 → 無解，
+#    舊的脫離模式挑「動作最小」＝不轉頭，車頭朝 −24° 停了 6 秒，目標走出畫面、跟丟。
+#    要求：3 秒內車頭轉到目標在相機視野內（±35°），15 秒後跟上，全程不碰貨架。
+def cbf_avoid_ctrl(walls):
+    def f(p, yaw, tg):
+        return follow_world(p, yaw, tg, walls=walls, avoid=tg, **GC)[:2]
+    return f
+
+
+tgt38 = lambda t: target_on_loop(1.9, t)                             # noqa: E731  (0,-7.1)
+
+
+def blind_run(run):
+    """目標在相機視野（±35°、8 m 內）外最長連續多久。"""
+    best = cur = 0.0
+    for x, y, yw, g in run:
+        out = (abs(wrap_pi(math.atan2(g[1] - y, g[0] - x) - yw)) > 0.6
+               or math.dist((x, y), g) > 8.0)
+        cur = cur + 0.05 if out else 0.0
+        best = max(best, cur)
+    return best
+
+
+run = simulate(-1.21, -7.06, math.radians(-24), tgt38, 15.0, cbf_avoid_ctrl(RAW1))
+b38 = blind_run(run)
+c38 = min(body_clear(x, y, yw, RAW1) for x, y, yw, _ in run)
+d38 = math.dist(run[-1][:2], run[-1][3])
+if b38 > 1.5:
+    fails.append(f"㊳ 目標從旁經過後，在視野外連續 {b38:.1f} 秒（應該轉頭跟著，≤ 1.5）")
+if c38 <= 0.0 or d38 > GW["standoff"] + 1.0:
+    fails.append(f"㊳ 貨架角旁跟上目標：車身最近 {c38:.2f} m，15 秒後離目標 {d38:.2f} m")
+
+#    對照組：把濾波器換回修正前（無解時不放掉「不撞目標」、脫離時挑動作最小）
+import husky_api_node as HA                                                 # noqa: E402
+
+
+def _old_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None, max_fwd=1.0, max_back=0.7,
+                max_yawrate=1.0, alpha=2.0, margin=0.2, w_yaw=0.2, body=None):
+    cons = HA.cbf_constraints(p, yaw, walls, area, avoid, alpha, margin, body)
+    v, w, okk = HA.cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw)
+    if okk:
+        return v, w, None
+    best = None
+    for i in range(21):
+        vv = -max_back + (max_fwd + max_back) * i / 20
+        for j in range(21):
+            ww = -max_yawrate + 2 * max_yawrate * j / 20
+            worst = min((av * vv + aw * ww - bb) / max(math.hypot(av, aw), 1e-9)
+                        for av, aw, bb, _ in cons)
+            key = (round(worst, 6), -abs(ww), -abs(vv))
+            if best is None or key > best[0]:
+                best = (key, vv, ww)
+    return best[1], best[2], "close"
+
+
+_keep = HA.cbf_filter
+HA.cbf_filter = _old_filter
+try:
+    run = simulate(-1.21, -7.06, math.radians(-24), tgt38, 15.0, cbf_avoid_ctrl(RAW1))
+finally:
+    HA.cbf_filter = _keep
+b38_old = blind_run(run)
+if b38_old <= 1.5:
+    fails.append(f"㊳ 對照組（修正前）應該讓目標離開視野很久，結果只有 {b38_old:.1f} 秒 —— "
+                 "這個情境沒有重現 SITL 的問題，測試本身無效")
+
+print(f"   ㊳ SITL 卡住那一刻：目標在視野外最長 {b38:.1f} 秒（修正前 {b38_old:.1f} 秒），"
+      f"車身最近 {c38:.2f} m，15 秒後 {d38:.2f} m")
+print(f"   ㊲ CBF 重跑舊情境：⑳ 最近 {c37_20:.2f} m／站位 {d37_20:.2f} m　"
+      f"㉑ 最北 {y37:.2f}、和目標最近 {s37:.2f} m　㉔ 最近 {c37_24:.2f} m／{d37_24:.2f} m")
+print("      ㉛ CBF " + "  ".join(f"{a:.1f}/{b:.1f}/{c:.2f}/{d:.1f}" for a, b, c, d in r31c))
+print(f"   ㉝ 求解器 vs 暴力搜尋：{n33} 個情境，{bad33} 個不是最佳")
+print(f"   ㉟ 隨機 150 次：車身離貨架/牆最近 {c35:.3f} m")
+print(f"   ㊱ 貨架角旁轉頭：CBF 最近 {c36:.3f} m（不擋時 {c36_raw:.2f} m）")
 print(f"   ⑳ 繞貨架角：新 最近 {c_new:.2f} m／舊 {c_old:.2f} m（負的＝撞進去）")
 print(f"   ㉔ 貨架角旁脫出：最近 {c24:.2f} m（拿掉「不准轉頭」時 {c24_nr:.2f} m），"
       f"25 秒時離目標 {d24:.2f} m")

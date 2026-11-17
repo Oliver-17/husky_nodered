@@ -413,8 +413,16 @@ def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
                  max_yawrate, deadband, walls=(), area=None,
                  wall_margin=TRACK_WALL_MARGIN_M, rot_clear=TRACK_ROT_CLEAR_M,
                  wall_h=TRACK_WALL_LOOKAHEAD_S, area_h=TRACK_POCKET_LOOKAHEAD_S,
-                 aim=None, gap=None):
+                 aim=None, gap=None, safety="rules", avoid=None,
+                 cbf_alpha=None, cbf_margin=None):
     """跟隨控制律 ＋ 擋牆（差速車）。回傳 (v, w, why)。
+
+    safety（2026-11-17）：
+        'rules'  下面那三層手寫規則（預設，實測過的版本）
+        'cbf'    控制律算出想要的 (v, ω) 之後交給 cbf_filter（見那一段的說明）。
+                 avoid＝目標車位置（防碰撞用，可以不給）。
+                 wall_margin／rot_clear／wall_h／area_h 在這個模式不用 ——
+                 車身用兩個圓＋cbf_margin，限制式本身就是連續的、不需要預看幾秒。
 
     aim / gap（2026-11-16，沿足跡跟用，見 trail_plan）：
         aim  往哪個點開（足跡上車前方的點）。None = 直接朝 tgt
@@ -444,6 +452,12 @@ def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
       最後再用**實際的車頭方向**檢查一次（車頭可能還沒轉過來）：
       被砍掉超過一半就不走、只轉頭。
     """
+    if safety == "cbf":
+        return _follow_world_cbf(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
+                                 max_yawrate, deadband, walls, area, aim, gap, avoid,
+                                 CBF_ALPHA if cbf_alpha is None else cbf_alpha,
+                                 CBF_MARGIN_M if cbf_margin is None else cbf_margin)
+
     # ⓪ 太靠近：不准轉頭。⚠️ 必須在最前面 —— 「已就位」那條路徑 v=0 但 w≠0，
     #    2026-11-15 掃到貨架角的那一下就是從那裡轉的，放在後面會被它先 return 掉。
     if walls and rot_clear > 0.0:
@@ -512,6 +526,321 @@ def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
             v = v * frac if frac >= need else 0.0
             why = why or why2
     return v, w, why
+
+
+# =============================================================================
+#  CBF 安全濾波（2026-11-17）—— 取代 follow_world 裡的三層手寫擋牆規則
+#
+#  為什麼：手寫規則是「預看 1 秒會撞就把那個方向砍成 0」的開關式做法，
+#  每一層都是為了補一個實測出來的洞（沿牆滑、0.65 m 不准轉頭、讓路範圍），
+#  層與層之間的互動要一條一條推理。CBF 用同一條式子處理全部：
+#
+#      h(x) ≥ 0 代表安全，要求  ḣ ≥ −α·h
+#      ＝「往邊界靠近的速度，不准超過 α × 離邊界還有多遠」
+#      → 越近越慢、剛好停在邊界上，數學上不會穿過去。
+#
+#  然後在所有限制都滿足的 (v, ω) 裡，挑「離 P 控制器想要的那組」最近的。
+#  什麼都沒擋到時答案就是原本那組，平常跟隨的手感不變。
+#
+#  🔑 車身怎麼表示（2026-11-17 C2 實測後改過一次，兩種都留著）：
+#
+#     'one'（預設）一個大圓：圓心在車中心、半徑 = 車身外接圓 0.6 m
+#         車在圓裡怎麼轉都不會超出圓 → 只要 h ≥ 0，**原地轉頭永遠安全**，
+#         CBF 只需要限制 v。幾何上就是舊規則的「方框加大 0.8 m」。
+#         轉向由前面的控制律（沿足跡跟）負責，CBF 只負責「靠近時減速」。
+#
+#     'two' 車頭、車尾各一個小圓（圓心 ±0.25 m、半徑 0.415 m）
+#         圓心速度 = v·(cosθ, sinθ) ± l·ω·(−sinθ, cosθ)，ω 出現在限制裡，
+#         濾波器可以選擇「轉開」。看起來比較好，但有一個**一定會掉進去的陷阱**：
+#         車和貨架平行、兩個圓同時貼在邊界上時，往哪邊轉都會讓其中一個圓
+#         靠近貨架，前進後退又不改變距離 → 只准「不轉、沿著滑」。
+#         控制律想停下來轉頭看目標時，答案就只剩 (0, 0)，永遠卡住。
+#         （測試㉔ 的情境，α=2 時卡了 9 秒、跟丟目標。）
+#
+#  'one' 唯一的例外：車中心已經在 0.65 m 以內（外接圓 0.6 ＋ 0.05）時轉頭會掃到。
+#  CBF 保證車不會「走進」那裡，所以只有一開始就在那裡才會遇到（例如
+#  舊規則時代留下的狀態、或被推進去）—— 這時禁止轉頭，只准往外退。
+# =============================================================================
+CBF_BODY = "one"            # 'one' 或 'two'，見上面
+CBF_BODY_R_M = 0.6          # 'one' 的圓半徑：外接圓 √(0.495² + 0.335²) = 0.598
+CBF_ROT_CLEAR_M = 0.65      # 'one'：中心比這個近就禁止轉頭（外接圓 ＋ 0.05）
+CBF_CIRCLE_OFF_M = 0.25     # 'two'：前後圓心離車中心多遠
+CBF_CIRCLE_R_M = 0.415      # 'two'：圓半徑，蓋住半個車身 √(0.245² + 0.335²)
+CBF_MARGIN_M = 0.2          # 圓外再留多少（'one' 時 0.6 ＋ 0.2 = 0.8，和舊規則一致）
+CBF_ALPHA = 2.0             # 越大越晚反應；α·dt 要 < 1（10 Hz 時 α < 10）
+CBF_W_YAW = 0.2             # 改 ω 的代價是改 v 的幾倍 —— 小於 1 ＝ 寧可轉開也不要停
+# 第一層（決定往哪走）比第二層（保證不撞）多留這麼多（2026-11-17 C2 實測）。
+# 兩層邊界一樣時，車會沿著邊界滑、h 漸近 0，第二層允許的速度上限
+# α·h / sin(車頭往牆偏的角度) 也跟著趨近 0 —— 車頭只要偏 0.3° 就停住（測試⑳卡了 6.7 秒）。
+# 讓第一層沿 0.95 m 的線滑，第二層在 0.8 m 把關，中間 0.15 m 吸收車頭的偏差。
+CBF_PLAN_EXTRA_M = 0.15
+CBF_TGT_MIN_M = 1.5         # 離目標車中心最少多遠（只防碰撞；跟隨距離由 P 控制管）
+# 限制離得夠遠時不可能起作用：|av·v + aw·ω| ≤ 1.0 + 0.25×1.0 = 1.25 < 2。
+# 跳過它們只是省計算，答案不變。
+CBF_SKIP_ALPHA_H = 2.0
+
+
+def _box_signed(c, b):
+    """點 c 到方框 b：(帶號距離, 往外的單位法向量)。在框裡時距離是負的（穿進去多深）。"""
+    dx = max(b[0] - c[0], 0.0, c[0] - b[2])
+    dy = max(b[1] - c[1], 0.0, c[1] - b[3])
+    if dx > 0.0 or dy > 0.0:
+        qx = min(max(c[0], b[0]), b[2])
+        qy = min(max(c[1], b[1]), b[3])
+        d = math.hypot(c[0] - qx, c[1] - qy)
+        return d, ((c[0] - qx) / d, (c[1] - qy) / d)
+    pen, n = min([(c[0] - b[0], (-1.0, 0.0)), (b[2] - c[0], (1.0, 0.0)),
+                  (c[1] - b[1], (0.0, -1.0)), (b[3] - c[1], (0.0, 1.0))])
+    return -pen, n
+
+
+def cbf_constraints(p, yaw, walls=(), area=None, avoid=None, alpha=CBF_ALPHA,
+                    margin=CBF_MARGIN_M, body=None, tgt_min=CBF_TGT_MIN_M):
+    """列出所有限制，每條是 (av, aw, b, 種類)，意思是 av·v + aw·ω ≥ b。
+
+    walls  原始方框（不加大；車身用兩個圓＋margin 處理）
+    area   讓路範圍（矩形）。只管車中心
+    avoid  目標車位置（None＝不管）。只防碰撞
+    """
+    e = (math.cos(yaw), math.sin(yaw))          # 車頭方向
+    ep = (-e[1], e[0])                          # 車身左方
+    cons = []
+    body = body or CBF_BODY
+    if body == "one":
+        circles, r = [0.0], CBF_BODY_R_M
+        # 已經在 0.65 m 以內：轉頭會掃到 → ω 釘在 0（兩條相反的限制）
+        if walls and min(point_box_dist(p, b) for b in walls) < CBF_ROT_CLEAR_M:
+            cons += [(0.0, 1.0, 0.0, "spin"), (0.0, -1.0, 0.0, "spin")]
+    else:
+        circles, r = [CBF_CIRCLE_OFF_M, -CBF_CIRCLE_OFF_M], CBF_CIRCLE_R_M
+    # ① 貨架與牆：每個圓一條
+    for off in circles:
+        s, off = (1.0 if off >= 0 else -1.0), abs(off)
+        c = (p[0] + s * off * e[0], p[1] + s * off * e[1])
+        for b in walls:
+            d, n = _box_signed(c, b)
+            h = d - r - margin
+            if alpha * h > CBF_SKIP_ALPHA_H:
+                continue
+            # ḣ = n · 圓心速度 = v·(n·e) + ω·s·l·(n·ep)
+            cons.append((n[0] * e[0] + n[1] * e[1],
+                         s * off * (n[0] * ep[0] + n[1] * ep[1]),
+                         -alpha * h, "wall"))
+    # ② 讓路範圍：車中心不准再往外。已經在外面（h<0）時只是「不准更外面」，
+    #    不硬拉回來 —— 和舊規則一樣（車剛從生成點開過來時本來就在外面）。
+    if area is not None:
+        for h, gx, gy in ((p[0] - area[0], 1.0, 0.0), (area[2] - p[0], -1.0, 0.0),
+                          (p[1] - area[1], 0.0, 1.0), (area[3] - p[1], 0.0, -1.0)):
+            if alpha * h > CBF_SKIP_ALPHA_H:
+                continue
+            cons.append((gx * e[0] + gy * e[1], 0.0, -alpha * max(h, 0.0), "area"))
+    # ③ 目標車：不准撞上去。同樣 h<0 時只是不准更近。
+    #    ⚠️ 只防碰撞（1.5 m），不是跟隨距離 —— 讓路時目標本來就會從車旁 1.5~2 m 經過。
+    if avoid is not None:
+        dx, dy = p[0] - avoid[0], p[1] - avoid[1]
+        d = math.hypot(dx, dy)
+        h = d - tgt_min
+        if d > 1e-6 and alpha * h <= CBF_SKIP_ALPHA_H:
+            cons.append(((dx * e[0] + dy * e[1]) / d, 0.0, -alpha * max(h, 0.0), "target"))
+    return cons
+
+
+def qp_project(z0, lines):
+    """把點 z0 投影到凸多邊形 {z : a1·z1 + a2·z2 ≥ b, 對每一條 (a1, a2, b)} 上。
+    回傳最近的可行點，沒有可行點時回 None。
+
+    只有兩個變數，最近點一定是下面三種之一：
+        ⓐ z0 本身（已經在多邊形裡）
+        ⓑ 投影到某一條邊上
+        ⓒ 某兩條邊的交點（角落）
+    全部列出來、留下可行的、挑最近的。不用裝求解器，Jetson 上也一樣。
+    """
+    def ok(z):
+        return all(a1 * z[0] + a2 * z[1] >= b - 1e-9 for a1, a2, b in lines)
+
+    if ok(z0):
+        return z0
+    cands = []
+    for a1, a2, b in lines:
+        nn = a1 * a1 + a2 * a2
+        if nn < 1e-12:
+            continue
+        g = (b - (a1 * z0[0] + a2 * z0[1])) / nn
+        if g > 0.0:
+            cands.append((z0[0] + g * a1, z0[1] + g * a2))
+    for i in range(len(lines)):
+        a1, a2, b1 = lines[i]
+        for j in range(i + 1, len(lines)):
+            c1, c2, b2 = lines[j]
+            det = a1 * c2 - a2 * c1
+            if abs(det) < 1e-12:
+                continue
+            cands.append(((b1 * c2 - a2 * b2) / det, (a1 * b2 - b1 * c1) / det))
+    best = None
+    for z in cands:
+        if ok(z):
+            dd = (z[0] - z0[0]) ** 2 + (z[1] - z0[1]) ** 2
+            if best is None or dd < best[0]:
+                best = (dd, z)
+    return None if best is None else best[1]
+
+
+def cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw=CBF_W_YAW):
+    """在所有限制＋速度上下限裡，找離 (v0, ω0) 最近的 (v, ω)。回傳 (v, ω, 有沒有解)。
+
+    「最近」用 (v−v0)² + w_yaw·(ω−ω0)² 量。換成 z = (v, √w_yaw·ω) 之後就是
+    普通的歐式距離，交給 qp_project。
+    """
+    k = math.sqrt(w_yaw)
+    lines = [(av, aw / k, b) for av, aw, b, _ in cons]
+    lines += [(1.0, 0.0, -max_back), (-1.0, 0.0, -max_fwd),
+              (0.0, 1.0, -k * max_yawrate), (0.0, -1.0, -k * max_yawrate)]
+    z = qp_project((v0, k * w0), lines)
+    if z is None:
+        return v0, w0, False
+    return z[0], z[1] / k, True
+
+
+def cbf_world(p, want, walls=(), area=None, alpha=CBF_ALPHA, margin=CBF_MARGIN_M):
+    """第一層：在「想往哪走」（世界座標速度向量）上做 CBF。回傳 (安全的速度向量, why)。
+
+    把車當成可以往任何方向走的點，h = 車中心離方框的距離 − (外接圓 0.6 ＋ margin)，
+    ḣ = n · u（n 是離開方框的方向）。只有一條限制起作用時，答案就是把 want
+    往牆的分量砍到剛好允許、沿牆的分量（null space）完全不動 —— 這就是「沿牆滑」。
+    舊規則用「預看 1 秒會不會穿進方框」做同一件事；這裡換成連續的版本。
+    """
+    lines, kinds = [], []
+    for b in walls:
+        d, n = _box_signed(p, b)
+        h = d - CBF_BODY_R_M - margin
+        if alpha * h > CBF_SKIP_ALPHA_H:
+            continue
+        lines.append((n[0], n[1], -alpha * h))
+        kinds.append("wall")
+    if area is not None:
+        for h, gx, gy in ((p[0] - area[0], 1.0, 0.0), (area[2] - p[0], -1.0, 0.0),
+                          (p[1] - area[1], 0.0, 1.0), (area[3] - p[1], 0.0, -1.0)):
+            if alpha * h > CBF_SKIP_ALPHA_H:
+                continue
+            lines.append((gx, gy, -alpha * max(h, 0.0)))
+            kinds.append("area")
+    u = qp_project(want, lines)
+    if u is None:
+        return (0.0, 0.0), "close"
+    if math.dist(u, want) < 0.02:
+        return want, None
+    tight = {k for (a1, a2, b), k in zip(lines, kinds) if a1 * u[0] + a2 * u[1] - b < 1e-6}
+    return u, ("area" if "area" in tight else "wall")
+
+
+def cbf_escape(cons, v0, w0, max_fwd, max_back, max_yawrate, w_yaw=CBF_W_YAW, n=21):
+    """沒有解的時候（已經在邊界外一點點、又被別的限制堵住）：
+    挑「最差那條限制改善最多」的指令；一樣好的裡面，挑**最接近原本想做的事**。
+
+    ⚠️ 以前同分時挑「動作最小的」—— 2026-11-17 SITL 實測：車在貨架角旁、
+       目標從旁邊經過時無解，挑到「不轉頭」，車頭朝著同一個方向停了 6 秒，
+       目標走出畫面、跟丟。轉頭在大圓模型裡不改變任何限制（安全），
+       所以應該照控制律的意思繼續轉頭看目標。
+
+    用格點掃一遍就好 —— 這只在異常時用。每條限制的違反量先除以 |a|
+    換成同一個尺度，否則係數大的那條會主導。
+    """
+    best = None
+    for i in range(n):
+        v = -max_back + (max_fwd + max_back) * i / (n - 1)
+        for j in range(n + 1):
+            # 最後一格放原本的 ω0：格點不一定剛好有它
+            w = w0 if j == n else -max_yawrate + 2.0 * max_yawrate * j / (n - 1)
+            worst = min(((av * v + aw * w - b) / max(math.hypot(av, aw), 1e-9)
+                         for av, aw, b, _ in cons), default=0.0)
+            key = (round(worst, 3), -((v - v0) ** 2 + w_yaw * (w - w0) ** 2))
+            if best is None or key > best[0]:
+                best = (key, v, w)
+    return best[1], best[2]
+
+def cbf_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None,
+               max_fwd=TRACK_MAX_SPEED, max_back=TRACK_BACKUP_SPEED,
+               max_yawrate=TRACK_MAX_YAWRATE, alpha=CBF_ALPHA, margin=CBF_MARGIN_M,
+               w_yaw=CBF_W_YAW, body=None):
+    """CBF 安全濾波。回傳 (v, ω, why)，why 和 follow_world 同一套：
+        None    沒改（或只改了一點點）
+        'wall'  被貨架／牆的限制改掉
+        'area'  被讓路範圍擋住
+        'close' 已經太近、沒有安全解，正在脫離
+    被目標車那條改掉時回 None —— 那是 P 控制器本來就在處理的事（倒車），
+    不另外顯示訊息。
+    """
+    cons = cbf_constraints(p, yaw, walls, area, avoid, alpha, margin, body)
+    v, w, feasible = cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw)
+    if not feasible:
+        # 優先順序：貨架／牆／讓路範圍是硬的，「不撞目標」先讓。
+        # 2026-11-17 SITL：讓路時目標從車旁 1.1 m 經過，「離貨架角遠一點」要往目標那邊退，
+        # 「不准再靠近目標」又不讓 → 無解。目標車在模擬裡沒有碰撞，這條本來就只是保險。
+        cons = [c for c in cons if c[3] != "target"]
+        v, w, feasible = cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw)
+    if not feasible:
+        v, w = cbf_escape(cons, v0, w0, max_fwd, max_back, max_yawrate, w_yaw)
+        return v, w, "close"
+    if abs(v - v0) < 0.02 and abs(w - w0) < 0.05:
+        return v, w, None
+    tight = {kind for av, aw, b, kind in cons if av * v + aw * w - b < 1e-6}
+    why = ("area" if "area" in tight else
+           "close" if "spin" in tight and abs(w0) > 0.05 else
+           "wall" if "wall" in tight else None)
+    return v, w, why
+
+
+def _follow_world_cbf(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
+                      max_yawrate, deadband, walls, area, aim, gap, avoid, alpha, margin):
+    """follow_world 的 CBF 版本。什麼都沒擋到時和 rules 版一模一樣（測試㉜）。
+
+    兩層，對應舊規則的 ①②③＋最後檢查，只是每一步換成 CBF：
+      ① 想往哪走：沿「車 → 瞄準點」，大小用距離律（太遠往前、太近往後）
+      ② 第一層 CBF（cbf_world）：在世界座標速度上砍掉往牆的分量 → 沿牆滑的方向
+      ③ 換成差速車的 v、ω：往前時車頭轉向②的方向；倒車時車頭照樣對著目標
+      ④ 第二層 CBF（cbf_filter）：車頭可能還沒轉過來，用實際車頭方向再把關一次
+    為什麼要兩層（2026-11-17 C2 實測）：只有④的話，目標在貨架角另一邊時
+    車頭對著貨架、速度被降到 0，不會自己轉開（測試⑳卡了 16 秒）。
+    ②負責「往哪走才過得去」，④負責「保證不撞」。
+    """
+    e_tgt = wrap_pi(math.atan2(tgt[1] - p[1], tgt[0] - p[0]) - yaw)
+    if aim is not None and math.dist(aim, p) > 1e-6:
+        dx, dy = aim[0] - p[0], aim[1] - p[1]
+    else:
+        dx, dy = tgt[0] - p[0], tgt[1] - p[1]
+    dist = math.hypot(dx, dy)
+    e_t = wrap_pi(math.atan2(dy, dx) - yaw)
+    d_err = gap if gap is not None else math.dist(tgt, p)
+    v, w = follow_cmd(d_err, e_t, standoff, kp_lin, kp_yaw,
+                      max_fwd, max_back, max_yawrate, deadband)
+    e_d = d_err - standoff
+    why1 = None
+    if abs(e_d) < deadband or dist < 1e-6:
+        if aim is not None:
+            w = max(-max_yawrate, min(max_yawrate, kp_yaw * e_tgt))   # 停著時看目標
+    else:
+        # ①②
+        sp = max(-max_back, min(max_fwd, dist_speed(e_d, kp_lin, deadband)))
+        want = (sp * dx / dist, sp * dy / dist)
+        u, why1 = cbf_world(p, want, walls, area, alpha, margin + CBF_PLAN_EXTRA_M)
+        # ③
+        if why1 is not None:
+            spd = math.hypot(u[0], u[1])
+            if sp > 0.0:
+                if spd < 1e-3:
+                    v = 0.0                          # 整個被擋：原地等、車頭對著目標
+                else:
+                    e = wrap_pi(math.atan2(u[1], u[0]) - yaw)
+                    w = max(-max_yawrate, min(max_yawrate, kp_yaw * e))
+                    v = spd * math.cos(e) if abs(e) <= TRACK_YAW_ONLY_RAD else 0.0
+            else:
+                v = max(-max_back, min(0.0, u[0] * math.cos(yaw) + u[1] * math.sin(yaw)))
+                if abs(e_t) > TRACK_YAW_ONLY_RAD:
+                    v = 0.0
+    # ④
+    v, w, why2 = cbf_filter(p, yaw, v, w, walls, area, avoid, max_fwd, max_back,
+                            max_yawrate, alpha, margin)
+    return v, w, (why2 if why2 in ("close", "area") else (why1 or why2))
 
 
 def _seg_dist(p, a, b):
@@ -714,6 +1043,11 @@ class HuskyApi(Node):
         self.declare_parameter("track_wall_margin_m", TRACK_WALL_MARGIN_M)
         self.declare_parameter("track_wall_lookahead_s", TRACK_WALL_LOOKAHEAD_S)
         self.declare_parameter("track_pocket_m", TRACK_POCKET_M)
+        # 擋牆用哪一套（2026-11-17）：'cbf' 安全濾波（預設）／'rules' 手寫三層規則。
+        # 見 cbf_filter 那一段。SITL 同場景各 180 秒：車身離貨架最近 0.15 → 0.39 m、
+        # 「先轉頭」13 → 0 秒、跟隨開始後沒有跟丟。出問題時改回 rules 就是舊行為。
+        self.declare_parameter("track_safety_filter", "cbf")
+        self.declare_parameter("track_cbf_alpha", CBF_ALPHA)
         # Nav2 的復原行為。和 nav_action 一樣，被推進 /husky 命名空間了。
         self.declare_parameter("spin_action", "/husky/spin")
         self.declare_parameter("backup_action", "/husky/backup")
@@ -1156,6 +1490,10 @@ class HuskyApi(Node):
         self._begin_task(name, duration + 10.0)
         where = (f"，看不到時巡 {len(sx)} 個搜尋點"
                  if sx else "，沒有給搜尋環線（看不到就原地等）")
+        sk = self._safety_kw()
+        self.get_logger().info(
+            f"[追蹤] 擋牆模式：{sk['safety']}"
+            + (f"（α={sk['cbf_alpha']:.1f}）" if sk["safety"] == "cbf" else ""))
         return self._reply(response, True,
                            f"開始追蹤：站位 {standoff:.1f} m、{duration:.0f} 秒{where}")
 
@@ -1352,7 +1690,8 @@ class HuskyApi(Node):
                   deadband=float(self.get_parameter("track_speed_deadband_m").value),
                   walls=self._scene.get("boxes") or [], area=self._pocket_area(),
                   wall_margin=float(self.get_parameter("track_wall_margin_m").value),
-                  wall_h=float(self.get_parameter("track_wall_lookahead_s").value))
+                  wall_h=float(self.get_parameter("track_wall_lookahead_s").value),
+                  **self._safety_kw())
         v = w = 0.0
         if t["chase"] == "go":
             plan = trail_plan(p, trail, trail[-1], on_m=TRAIL_CHASE_ON_M)
@@ -1549,7 +1888,7 @@ class HuskyApi(Node):
             dead, walls=self._scene.get("boxes") or [], area=self._pocket_area(),
             wall_margin=float(self.get_parameter("track_wall_margin_m").value),
             wall_h=float(self.get_parameter("track_wall_lookahead_s").value),
-            aim=aim, gap=gap)
+            aim=aim, gap=gap, avoid=(tx, ty), **self._safety_kw())
 
         # 先決定「哪一種」訊息，再經過 hold_kind 防抖，最後才填數字。
         # ⚠️ 用 < 0.01 不用 == 0：被夾到只剩 -0.003 這種值時，訊息會變成
@@ -1592,6 +1931,15 @@ class HuskyApi(Node):
         m.linear.x = v
         m.angular.z = w
         self.pub_cmd.publish(m)
+
+    def _safety_kw(self):
+        """follow_world 的擋牆模式參數。avoid（目標車位置）由呼叫的地方決定要不要給 ——
+        跟丟後沿足跡開的那段不給：那時目標已經不在足跡尾巴了。"""
+        mode = str(self.get_parameter("track_safety_filter").value).strip().lower()
+        if mode not in ("rules", "cbf"):
+            mode = "rules"
+        return dict(safety=mode,
+                    cbf_alpha=float(self.get_parameter("track_cbf_alpha").value))
 
     def _pocket_area(self):
         """倒車讓路的範圍：搜尋環線的外接矩形往外放寬 track_pocket_m。
