@@ -519,6 +519,7 @@ if hold_kind(st, "close", 1.3, 1.0, immediate=True) != "close":
 #  目標不見；不見後也沒去它最後出現的位置，而是去上個經過的轉角」）
 #  ㉘~㉚ 驗純函式；㉛ 用轉角小模擬（含相機視角與貨架擋視線）比新舊。
 # =============================================================================
+from husky_api_node import vel_update                              # noqa: E402
 from husky_api_node import (trail_add, trail_plan, trail_heading,       # noqa: E402
                             leg_and_dir, nearest_leg, next_wp, wrap_pi)
 
@@ -599,7 +600,10 @@ def _visible(p, yaw, tg):
     return not any(_seg_hits(p, tg, b) for b in RAW[:3])
 
 
-def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules"):
+JERK = [0.0]                 # corner_run 累積的 |Δω|（車頭轉速變化，看會不會抖）
+
+
+def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules", fov=False):
     """回傳 (擋牆介入秒數, 看不到的秒數, 車身離貨架最近, 最後離目標多遠)。
     new=True 照節點的新流程：看得到 → 沿足跡跟；看不到 → 沿足跡開到尾巴、轉向；
     new=False 是舊的：朝最後看到的位置直線追 5 秒。"""
@@ -607,6 +611,7 @@ def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules"):
     rnd = random.Random(seed)
     x, y, yaw, v, w = 0.0, -1.5, math.pi / 2, 0.0, 0.0
     last, last_t, filt, trail, chase = None, -1e9, None, [], None
+    vst, vel = {}, (0.0, 0.0)
     wall = blind = 0.0
     clear = 9.0
     vc = wc = 0.0
@@ -624,6 +629,7 @@ def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules"):
                 filt = last if filt is None or math.dist(filt, last) > 1.5 else \
                     (filt[0] + a * (last[0] - filt[0]), filt[1] + a * (last[1] - filt[1]))
                 trail_add(trail, filt)
+                vel = vel_update(vst, filt, t)
                 chase = None
             else:
                 blind += 0.1
@@ -632,12 +638,15 @@ def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules"):
             if last is not None and not new and age <= 5.0:
                 vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **dict(GW, safety=safety))
             elif last is not None and new and age <= 1.5:
+                fv = (filt, vel) if fov else None
                 pl = trail_plan((x, y), trail, filt)
                 if pl and pl[1] >= GW["standoff"] - GW["deadband"]:
                     vc, wc, why = follow_world((x, y), yaw, filt, walls=RAW,
-                                               aim=pl[0], gap=pl[1], **dict(GW, safety=safety))
+                                               aim=pl[0], gap=pl[1], fov=fv,
+                                               **dict(GW, safety=safety))
                 else:
-                    vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, **dict(GW, safety=safety))
+                    vc, wc, why = follow_world((x, y), yaw, last, walls=RAW, fov=fv,
+                                               **dict(GW, safety=safety))
             elif last is not None and new:
                 if chase is None:
                     chase = "go" if trail_plan((x, y), trail, trail[-1], on_m=2.0) else "done"
@@ -660,7 +669,9 @@ def corner_run(new, seed, secs=45.0, dt=0.05, safety="rules"):
                 wall += 0.1
         lim = (1.0 if abs(vc) > abs(v) else 1.5) * dt
         v += max(-lim, min(lim, vc - v))
+        w_prev = w
         w += max(-3.2 * dt, min(3.2 * dt, wc - w))
+        JERK[0] += abs(w - w_prev)
         x += v * math.cos(yaw) * dt
         y += v * math.sin(yaw) * dt
         yaw += w * dt
@@ -859,7 +870,7 @@ import husky_api_node as HA                                                 # no
 
 
 def _old_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None, max_fwd=1.0, max_back=0.7,
-                max_yawrate=1.0, alpha=2.0, margin=0.2, w_yaw=0.2, body=None):
+                max_yawrate=1.0, alpha=2.0, margin=0.2, w_yaw=0.2, body=None, fov=None):
     cons = HA.cbf_constraints(p, yaw, walls, area, avoid, alpha, margin, body)
     v, w, okk = HA.cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw)
     if okk:
@@ -888,6 +899,107 @@ if b38_old <= 1.5:
     fails.append(f"㊳ 對照組（修正前）應該讓目標離開視野很久，結果只有 {b38_old:.1f} 秒 —— "
                  "這個情境沒有重現 SITL 的問題，測試本身無效")
 
+# =============================================================================
+#  C4 視野限制（2026-11-17）：目標要留在相機畫面內（±25°）
+# =============================================================================
+from husky_api_node import fov_constraint, CBF_FOV_MAX_RAD, CBF_FOV_ALPHA  # noqa: E402
+
+# ㊴ 推導驗證：限制式算出的 ḣ ＝ 往前推一小步實際量到的 h 變化
+#    （車照獨輪車模型走、目標照自己的速度走）。式子寫錯正負號或漏一項，這裡一定抓得到。
+rnd = random.Random(39)
+bad39 = 0
+for _ in range(300):
+    p = (rnd.uniform(-5, 5), rnd.uniform(-5, 5))
+    yaw = rnd.uniform(-math.pi, math.pi)
+    ang = yaw + rnd.uniform(-1.4, 1.4)
+    rr = rnd.uniform(1.0, 8.0)
+    g = (p[0] + rr * math.cos(ang), p[1] + rr * math.sin(ang))
+    vt = (rnd.uniform(-1, 1), rnd.uniform(-1, 1))
+    v, w = rnd.uniform(-0.7, 1.0), rnd.uniform(-1.0, 1.0)
+    av, aw, b = fov_constraint(p, yaw, g, vt)
+
+    def hof(p_, yaw_, g_):
+        return math.cos(wrap_pi(math.atan2(g_[1] - p_[1], g_[0] - p_[0]) - yaw_)) \
+            - math.cos(CBF_FOV_MAX_RAD)
+    h0 = hof(p, yaw, g)
+    dt = 1e-6
+    h1 = hof((p[0] + v * math.cos(yaw) * dt, p[1] + v * math.sin(yaw) * dt), yaw + w * dt,
+             (g[0] + vt[0] * dt, g[1] + vt[1] * dt))
+    num = (h1 - h0) / dt
+    pred = av * v + aw * w - (b + CBF_FOV_ALPHA * h0)
+    if abs(num - pred) > 1e-4:
+        bad39 += 1
+if bad39:
+    fails.append(f"㊴ 視野限制的 ḣ 和數值微分對不上：300 個裡 {bad39} 個")
+
+# ㊵ 目標在正前方、什麼都沒擋到 → 加了視野限制，指令完全不變
+v1 = follow_world((0, 0), 0.0, (6, 0), walls=[], **GC)
+v2 = follow_world((0, 0), 0.0, (6, 0), walls=[], fov=((6, 0), (0.0, 0.5)), **GC)
+if abs(v1[0] - v2[0]) > 1e-9 or abs(v1[1] - v2[1]) > 1e-9:
+    fails.append(f"㊵ 目標在正前方時視野限制不該介入：{v1[:2]} → {v2[:2]}")
+
+# ㊶ 目標在左前方 22°、正往左橫著走 0.5 m/s（轉角的情況）→ 車要更用力往左轉
+g41 = (4 * math.cos(math.radians(22)), 4 * math.sin(math.radians(22)))
+w_no = follow_world((0, 0), 0.0, g41, walls=[], aim=(1.5, 0.0), gap=4.0, **GC)[1]
+w_fov = follow_world((0, 0), 0.0, g41, walls=[], aim=(1.5, 0.0), gap=4.0,
+                     fov=(g41, (0.0, 0.5)), **GC)[1]
+#    CBF 只做「剛好夠」的修正：ω 要大到讓 ḣ ≥ −α·h（目標不再往畫面外跑得太快）
+v41 = follow_world((0, 0), 0.0, g41, walls=[], aim=(1.5, 0.0), gap=4.0,
+                   fov=(g41, (0.0, 0.5)), **GC)[0]
+a1, a2, b41 = fov_constraint((0, 0), 0.0, g41, (0.0, 0.5))
+if not (w_fov > w_no + 0.05 and a1 * v41 + a2 * w_fov >= b41 - 1e-6):
+    fails.append(f"㊶ 目標快出畫面時應該提早往它那邊轉：沒限制 ω={w_no:.2f}，有限制 ω={w_fov:.2f}")
+
+# ㊷ 和安全衝突時視野讓步：㉓ 的位置（中心離貨架角 0.52 m，禁止轉頭），
+#    目標在右邊 30° → 視野想要轉頭，但轉頭會掃到貨架 → ω 必須是 0
+p42, yaw42 = (-1.49, -7.06), math.radians(49)
+g42 = (p42[0] + 4 * math.cos(yaw42 - 0.5), p42[1] + 4 * math.sin(yaw42 - 0.5))
+v42, w42, _ = follow_world(p42, yaw42, g42, walls=RAW1, fov=(g42, (0.3, 0.0)), **GC)
+if abs(w42) > 1e-9:
+    fails.append(f"㊷ 貨架角旁不准轉頭，視野限制不能蓋過它：ω={w42:.3f}")
+
+# ㊸ 速度估計：目標 0.5 m/s 往北、位置加 0.1 m 雜訊並先平滑（和節點一樣），
+#    3 秒後估出來的速度誤差 < 0.15 m/s
+rnd = random.Random(43)
+vst, filt, t = {}, None, 0.0
+errs43 = []
+for i in range(60):
+    t = i * 0.1
+    meas = (rnd.gauss(0, 0.1), 0.5 * t + rnd.gauss(0, 0.1))
+    a = 1 - math.exp(-0.1 / 0.3)
+    filt = meas if filt is None else (filt[0] + a * (meas[0] - filt[0]), filt[1] + a * (meas[1] - filt[1]))
+    vel = vel_update(vst, filt, t)
+    if t >= 4.0:
+        errs43.append(math.hypot(vel[0], vel[1] - 0.5))
+#    單一瞬間會跳（位置雜訊差分後約 ±0.18 m/s），看最後 2 秒的平均誤差
+err43 = sum(errs43) / len(errs43)
+if err43 > 0.15:
+    fails.append(f"㊸ 目標速度估計最後 2 秒平均誤差 {err43:.2f} m/s（實際 (0, 0.5)）")
+
+# ㊹ C4-2 轉角對照：同一個轉角模擬，CBF vs CBF＋視野。看不到的秒數要明顯變少，
+#    而且一樣不碰貨架、一樣跟得上
+JERK[0] = 0.0
+_ = [corner_run(True, sd, safety="cbf") for sd in (1, 2, 3)]
+jerk_c = JERK[0]
+JERK[0] = 0.0
+r31f = [corner_run(True, sd, safety="cbf", fov=True) for sd in (1, 2, 3)]
+jerk_f = JERK[0]
+if jerk_f > jerk_c * 2.0:
+    fails.append(f"㊹ 加視野限制後車頭轉速變化量變成 {jerk_f / jerk_c:.1f} 倍（速度估計的雜訊讓車頭抖）")
+for sd, (wl, bl, cl, de), (_wl0, bl0, _cl0, _de0) in zip((1, 2, 3), r31f, r31c):
+    if cl < 0.3 or de > 5.0:
+        fails.append(f"㊹ 加視野限制後（種子 {sd}）：離貨架最近 {cl:.2f} m，最後離目標 {de:.1f} m")
+blind_c = sum(b for _, b, _, _ in r31c)
+blind_f = sum(b for _, b, _, _ in r31f)
+if blind_f > blind_c * 0.8:
+    fails.append(f"㊹ 視野限制沒有讓看不到的時間明顯變少：{blind_c:.1f} → {blind_f:.1f} 秒")
+
+print(f"   ㊴ 視野限制推導 vs 數值微分：300 個裡 {bad39} 個不合　㊸ 速度估計誤差 {err43:.2f} m/s")
+print(f"   ㊶ 目標快出畫面：ω {w_no:.2f} → {w_fov:.2f}　"
+      f"㊹ 車頭轉速變化量 {jerk_c:.1f} → {jerk_f:.1f} rad/s（3 個種子加總）")
+print("   ㊹ 轉角 看不到秒數／離貨架最近／最後距離：")
+print("      CBF      " + "  ".join(f"{b:.1f}/{c:.2f}/{d:.1f}" for _, b, c, d in r31c))
+print("      CBF＋視野 " + "  ".join(f"{b:.1f}/{c:.2f}/{d:.1f}" for _, b, c, d in r31f))
 print(f"   ㊳ SITL 卡住那一刻：目標在視野外最長 {b38:.1f} 秒（修正前 {b38_old:.1f} 秒），"
       f"車身最近 {c38:.2f} m，15 秒後 {d38:.2f} m")
 print(f"   ㊲ CBF 重跑舊情境：⑳ 最近 {c37_20:.2f} m／站位 {d37_20:.2f} m　"

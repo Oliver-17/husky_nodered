@@ -414,13 +414,14 @@ def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
                  wall_margin=TRACK_WALL_MARGIN_M, rot_clear=TRACK_ROT_CLEAR_M,
                  wall_h=TRACK_WALL_LOOKAHEAD_S, area_h=TRACK_POCKET_LOOKAHEAD_S,
                  aim=None, gap=None, safety="rules", avoid=None,
-                 cbf_alpha=None, cbf_margin=None):
+                 cbf_alpha=None, cbf_margin=None, fov=None):
     """跟隨控制律 ＋ 擋牆（差速車）。回傳 (v, w, why)。
 
     safety（2026-11-17）：
         'rules'  下面那三層手寫規則（預設，實測過的版本）
         'cbf'    控制律算出想要的 (v, ω) 之後交給 cbf_filter（見那一段的說明）。
                  avoid＝目標車位置（防碰撞用，可以不給）。
+                 fov＝(目標位置, 目標速度)：目標要留在相機畫面內（C4，可以不給）。
                  wall_margin／rot_clear／wall_h／area_h 在這個模式不用 ——
                  車身用兩個圓＋cbf_margin，限制式本身就是連續的、不需要預看幾秒。
 
@@ -456,7 +457,7 @@ def follow_world(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
         return _follow_world_cbf(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
                                  max_yawrate, deadband, walls, area, aim, gap, avoid,
                                  CBF_ALPHA if cbf_alpha is None else cbf_alpha,
-                                 CBF_MARGIN_M if cbf_margin is None else cbf_margin)
+                                 CBF_MARGIN_M if cbf_margin is None else cbf_margin, fov)
 
     # ⓪ 太靠近：不准轉頭。⚠️ 必須在最前面 —— 「已就位」那條路徑 v=0 但 w≠0，
     #    2026-11-15 掃到貨架角的那一下就是從那裡轉的，放在後面會被它先 return 掉。
@@ -574,6 +575,11 @@ CBF_W_YAW = 0.2             # 改 ω 的代價是改 v 的幾倍 —— 小於 1
 # α·h / sin(車頭往牆偏的角度) 也跟著趨近 0 —— 車頭只要偏 0.3° 就停住（測試⑳卡了 6.7 秒）。
 # 讓第一層沿 0.95 m 的線滑，第二層在 0.8 m 把關，中間 0.15 m 吸收車頭的偏差。
 CBF_PLAN_EXTRA_M = 0.15
+# C4 視野限制（2026-11-17）：目標要留在相機畫面內。
+#   相機左右各 35°（horizontal_fov 1.204），邊界設 25°：留 10° 給延遲和雜訊，
+#   而且要「快到邊緣就開始轉」，不是出畫面才轉。
+CBF_FOV_MAX_RAD = math.radians(25.0)
+CBF_FOV_ALPHA = 2.0
 CBF_TGT_MIN_M = 1.5         # 離目標車中心最少多遠（只防碰撞；跟隨距離由 P 控制管）
 # 限制離得夠遠時不可能起作用：|av·v + aw·ω| ≤ 1.0 + 0.25×1.0 = 1.25 < 2。
 # 跳過它們只是省計算，答案不變。
@@ -595,7 +601,8 @@ def _box_signed(c, b):
 
 
 def cbf_constraints(p, yaw, walls=(), area=None, avoid=None, alpha=CBF_ALPHA,
-                    margin=CBF_MARGIN_M, body=None, tgt_min=CBF_TGT_MIN_M):
+                    margin=CBF_MARGIN_M, body=None, tgt_min=CBF_TGT_MIN_M,
+                    fov=None, fov_max=CBF_FOV_MAX_RAD, fov_alpha=CBF_FOV_ALPHA):
     """列出所有限制，每條是 (av, aw, b, 種類)，意思是 av·v + aw·ω ≥ b。
 
     walls  原始方框（不加大；車身用兩個圓＋margin 處理）
@@ -642,7 +649,45 @@ def cbf_constraints(p, yaw, walls=(), area=None, avoid=None, alpha=CBF_ALPHA,
         h = d - tgt_min
         if d > 1e-6 and alpha * h <= CBF_SKIP_ALPHA_H:
             cons.append(((dx * e[0] + dy * e[1]) / d, 0.0, -alpha * max(h, 0.0), "target"))
+    # ④ 視野（C4）：fov = (目標位置, 目標速度)。目標要留在相機 ±fov_max 以內。
+    if fov is not None:
+        c = fov_constraint(p, yaw, fov[0], fov[1], fov_max, fov_alpha)
+        if c is not None:
+            cons.append(c + ("fov",))
     return cons
+
+
+def fov_constraint(p, yaw, g, vt=(0.0, 0.0), fov_max=CBF_FOV_MAX_RAD, alpha=CBF_FOV_ALPHA):
+    """「目標留在畫面內」的限制，回傳 (av, aw, b)（av·v + aw·ω ≥ b），不啟用時回 None。
+
+        β = 目標在車頭的哪個方向（0 = 正前方）
+        h = cos β − cos(fov_max)        ≥ 0 ＝ 目標在 ±fov_max 以內
+
+    β 會因為三件事改變，ḣ 就是三項加起來（推導：φ 是視線方向、β = φ − θ）：
+        ḣ = −sin β · (φ̇ − ω)
+        φ̇ = [ (r × 目標速度) − v·(rx·sinθ − ry·cosθ) ] / r²        r = 目標 − 車
+      → ḣ =  sin β · ω                                ① 車轉頭：直接把 β 拉回來
+           + sin β ·(rx·sinθ − ry·cosθ)/r² · v       ② 車往前開：目標偏在旁邊時越開越偏
+           − sin β ·(r × 目標速度)/r²                 ③ 目標自己橫著走（轉角就是這個）
+    ③ 不含 v、ω，所以移到右邊變成 b 的一部分。沒有目標速度的話③是 0，
+    限制只會在目標已經偏出去之後才反應 —— 提早轉頭就靠這一項。
+
+    目標在 ±90° 以外（例如讓路倒車時）不啟用：那時車頭本來就由控制律對著目標，
+    而且 sin β 在 90° 附近變號，硬套會叫車往反方向轉。
+    """
+    rx, ry = g[0] - p[0], g[1] - p[1]
+    r2 = rx * rx + ry * ry
+    if r2 < 0.25:
+        return None
+    beta = wrap_pi(math.atan2(ry, rx) - yaw)
+    if abs(beta) >= math.pi / 2:
+        return None
+    sb = math.sin(beta)
+    h = math.cos(beta) - math.cos(fov_max)
+    av = sb * (rx * math.sin(yaw) - ry * math.cos(yaw)) / r2
+    aw = sb
+    b = -alpha * h + sb * (rx * vt[1] - ry * vt[0]) / r2
+    return av, aw, b
 
 
 def qp_project(z0, lines):
@@ -761,7 +806,7 @@ def cbf_escape(cons, v0, w0, max_fwd, max_back, max_yawrate, w_yaw=CBF_W_YAW, n=
 def cbf_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None,
                max_fwd=TRACK_MAX_SPEED, max_back=TRACK_BACKUP_SPEED,
                max_yawrate=TRACK_MAX_YAWRATE, alpha=CBF_ALPHA, margin=CBF_MARGIN_M,
-               w_yaw=CBF_W_YAW, body=None):
+               w_yaw=CBF_W_YAW, body=None, fov=None):
     """CBF 安全濾波。回傳 (v, ω, why)，why 和 follow_world 同一套：
         None    沒改（或只改了一點點）
         'wall'  被貨架／牆的限制改掉
@@ -770,13 +815,17 @@ def cbf_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None,
     被目標車那條改掉時回 None —— 那是 P 控制器本來就在處理的事（倒車），
     不另外顯示訊息。
     """
-    cons = cbf_constraints(p, yaw, walls, area, avoid, alpha, margin, body)
+    cons = cbf_constraints(p, yaw, walls, area, avoid, alpha, margin, body, fov=fov)
     v, w, feasible = cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw)
-    if not feasible:
-        # 優先順序：貨架／牆／讓路範圍是硬的，「不撞目標」先讓。
-        # 2026-11-17 SITL：讓路時目標從車旁 1.1 m 經過，「離貨架角遠一點」要往目標那邊退，
-        # 「不准再靠近目標」又不讓 → 無解。目標車在模擬裡沒有碰撞，這條本來就只是保險。
-        cons = [c for c in cons if c[3] != "target"]
+    # 優先順序：貨架／牆／讓路範圍是硬的；解不出來時從最軟的開始放掉：
+    #   ① 目標留在畫面內（C4）—— 貨架真的擋住時只好讓目標暫時出畫面
+    #   ② 不撞目標 —— 2026-11-17 SITL：讓路時目標從車旁 1.1 m 經過，
+    #      「離貨架角遠一點」要往目標那邊退、「不准再靠近目標」又不讓 → 無解。
+    #      目標車在模擬裡沒有碰撞，這條本來就只是保險。
+    for drop in ("fov", "target"):
+        if feasible:
+            break
+        cons = [c for c in cons if c[3] != drop]
         v, w, feasible = cbf_solve(v0, w0, cons, max_fwd, max_back, max_yawrate, w_yaw)
     if not feasible:
         v, w = cbf_escape(cons, v0, w0, max_fwd, max_back, max_yawrate, w_yaw)
@@ -784,6 +833,7 @@ def cbf_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None,
     if abs(v - v0) < 0.02 and abs(w - w0) < 0.05:
         return v, w, None
     tight = {kind for av, aw, b, kind in cons if av * v + aw * w - b < 1e-6}
+    tight.discard("fov")              # 為了看目標而轉頭不算擋牆，不另外顯示
     why = ("area" if "area" in tight else
            "close" if "spin" in tight and abs(w0) > 0.05 else
            "wall" if "wall" in tight else None)
@@ -791,7 +841,8 @@ def cbf_filter(p, yaw, v0, w0, walls=(), area=None, avoid=None,
 
 
 def _follow_world_cbf(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
-                      max_yawrate, deadband, walls, area, aim, gap, avoid, alpha, margin):
+                      max_yawrate, deadband, walls, area, aim, gap, avoid, alpha, margin,
+                      fov=None):
     """follow_world 的 CBF 版本。什麼都沒擋到時和 rules 版一模一樣（測試㉜）。
 
     兩層，對應舊規則的 ①②③＋最後檢查，只是每一步換成 CBF：
@@ -839,7 +890,7 @@ def _follow_world_cbf(p, yaw, tgt, standoff, kp_lin, kp_yaw, max_fwd, max_back,
                     v = 0.0
     # ④
     v, w, why2 = cbf_filter(p, yaw, v, w, walls, area, avoid, max_fwd, max_back,
-                            max_yawrate, alpha, margin)
+                            max_yawrate, alpha, margin, fov=fov)
     return v, w, (why2 if why2 in ("close", "area") else (why1 or why2))
 
 
@@ -904,6 +955,30 @@ TRAIL_LOOKAHEAD_M = 1.5   # 瞄準足跡上車前方多遠的點。太短會蛇�
 TRAIL_ON_M = 1.0          # 車離足跡多近才算「在足跡上」（跟隨時）
 TRAIL_CHASE_ON_M = 2.0    # 跟丟後沿足跡開時放寬一點（擋牆可能把車推離足跡）
 TRAIL_HEADING_M = 1.5     # 用足跡尾巴這麼長的一段估目標往哪走
+
+
+# 目標速度估計（C4 視野限制要用：目標轉彎後往旁邊走，要靠速度才能提早轉頭）
+TGT_VEL_TAU_S = 0.5       # 速度再平滑一層。位置雜訊 0.1 m、10 Hz 直接差分會到 1.4 m/s
+TGT_VEL_GAP_S = 1.0       # 兩筆隔超過這麼久（中間跟丟過）就重新開始，不拿舊的差分
+
+
+def vel_update(st, pos, t, tau=TGT_VEL_TAU_S, gap=TGT_VEL_GAP_S):
+    """用平滑過的目標位置差分，再做一次低通，估目標速度。st 是 dict，原地更新。
+
+    回傳目前的速度估計 (vx, vy)。第一筆、或隔太久之後的第一筆回 (0, 0)：
+    寧可「以為它沒在動」也不要拿跨過一段空白的位置差當速度。
+    """
+    if st.get("p") is None or t - st["t"] > gap:
+        st.update(p=pos, t=t, v=(0.0, 0.0))
+        return st["v"]
+    dt = t - st["t"]
+    if dt <= 1e-3:
+        return st["v"]
+    raw = ((pos[0] - st["p"][0]) / dt, (pos[1] - st["p"][1]) / dt)
+    a = 1.0 - math.exp(-dt / tau)
+    v = (st["v"][0] + a * (raw[0] - st["v"][0]), st["v"][1] + a * (raw[1] - st["v"][1]))
+    st.update(p=pos, t=t, v=v)
+    return v
 
 
 def trail_add(trail, pt, step=TRAIL_STEP_M, max_len=TRAIL_MAX_M, reset=TRAIL_RESET_M):
@@ -1048,6 +1123,10 @@ class HuskyApi(Node):
         # 「先轉頭」13 → 0 秒、跟隨開始後沒有跟丟。出問題時改回 rules 就是舊行為。
         self.declare_parameter("track_safety_filter", "cbf")
         self.declare_parameter("track_cbf_alpha", CBF_ALPHA)
+        # C4 視野限制（2026-11-17）：目標要留在相機 ±25° 以內，轉角時提早轉頭。
+        # 只在 track_safety_filter=cbf 時有作用。SITL 同場景：開始跟隨後
+        # 「目標暫時看不到」13 秒（5 段）→ 0 秒。出問題時關掉就是 C3 的行為。
+        self.declare_parameter("track_cbf_fov", True)
         # Nav2 的復原行為。和 nav_action 一樣，被推進 /husky 命名空間了。
         self.declare_parameter("spin_action", "/husky/spin")
         self.declare_parameter("backup_action", "/husky/backup")
@@ -1123,6 +1202,8 @@ class HuskyApi(Node):
             "trail": [],            # 目標走過的路（平滑過的 map 座標點）
             "tgt_f": None,          # 平滑過的目標位置
             "tgt_f_t": None,
+            "tgt_vst": {},          # 目標速度估計的狀態（vel_update）
+            "tgt_vel": (0.0, 0.0),
             "trail_mode": False,    # 現在是不是沿足跡跟（只用來在切換時記 log）
             # 跟丟後的追法：None = 還沒決定；'go' = 沿足跡開到最後出現的位置；
             # 'turn' = 到了，轉向目標離開的方向；'done' = 做完了（接著跑搜尋）
@@ -1437,10 +1518,13 @@ class HuskyApi(Node):
         f = t["tgt_f"]
         if f is None or t["tgt_f_t"] is None or math.dist(f, pt) > 1.5:
             f = pt
+            t["tgt_vst"] = {}            # 換了位置（重新看到／換一台）：速度也重算
         else:
             a = 1.0 - math.exp(-max(now - t["tgt_f_t"], 0.0) / TRAIL_FILTER_S)
             f = (f[0] + a * (pt[0] - f[0]), f[1] + a * (pt[1] - f[1]))
         t["tgt_f"], t["tgt_f_t"] = f, now
+        # 目標速度（C4 視野限制用）。用平滑後的位置差分再平滑，見 vel_update
+        t["tgt_vel"] = vel_update(t.setdefault("tgt_vst", {}), f, now)
         if t["active"]:
             trail_add(t["trail"], f)
 
@@ -1482,7 +1566,8 @@ class HuskyApi(Node):
             recover_from_lost=False, last_dist=None,
             vel_mode=False, loop_step=1, loop_flipped=False, target_leg=None, wall_why=None,
             msg_hold={},
-            trail=[], tgt_f=None, tgt_f_t=None, trail_mode=False,
+            trail=[], tgt_f=None, tgt_f_t=None, tgt_vst={}, tgt_vel=(0.0, 0.0),
+            trail_mode=False,
             chase=None, chase_until=0.0, chased=False,
             message="開始追蹤")
         # 任務的逾時給寬一點：正常結束是由 _track_tick 在 deadline 時判成功，
@@ -1493,7 +1578,9 @@ class HuskyApi(Node):
         sk = self._safety_kw()
         self.get_logger().info(
             f"[追蹤] 擋牆模式：{sk['safety']}"
-            + (f"（α={sk['cbf_alpha']:.1f}）" if sk["safety"] == "cbf" else ""))
+            + (f"（α={sk['cbf_alpha']:.1f}，視野限制"
+               f"{'開' if self.get_parameter('track_cbf_fov').value else '關'}）"
+               if sk["safety"] == "cbf" else ""))
         return self._reply(response, True,
                            f"開始追蹤：站位 {standoff:.1f} m、{duration:.0f} 秒{where}")
 
@@ -1877,6 +1964,13 @@ class HuskyApi(Node):
         else:
             aim = gap = None
         e_d = dist - t["standoff"]
+        # C4：目標要留在畫面內。只在剛看到（fresh）時用 —— 位置舊了，
+        # 「讓它留在畫面內」就沒有意義，而且舊的速度會把車頭帶偏。
+        fov = None
+        if (self.get_parameter("track_cbf_fov").value
+                and age <= float(self.get_parameter("track_fresh_s").value)
+                and t["tgt_f"] is not None):
+            fov = (t["tgt_f"], t["tgt_vel"])
 
         v, w, why = follow_world(
             (hx, hy), yaw, (tx, ty), t["standoff"],
@@ -1888,7 +1982,7 @@ class HuskyApi(Node):
             dead, walls=self._scene.get("boxes") or [], area=self._pocket_area(),
             wall_margin=float(self.get_parameter("track_wall_margin_m").value),
             wall_h=float(self.get_parameter("track_wall_lookahead_s").value),
-            aim=aim, gap=gap, avoid=(tx, ty), **self._safety_kw())
+            aim=aim, gap=gap, avoid=(tx, ty), fov=fov, **self._safety_kw())
 
         # 先決定「哪一種」訊息，再經過 hold_kind 防抖，最後才填數字。
         # ⚠️ 用 < 0.01 不用 == 0：被夾到只剩 -0.003 這種值時，訊息會變成
